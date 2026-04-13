@@ -11,7 +11,7 @@ pub mod message;
 pub mod channel;
 
 pub use port::Port;
-pub use message::Message;
+pub use message::{Message, MESSAGE_INLINE_BYTES};
 
 /// Initialise the IPC subsystem. Called once from `kernel_main`.
 pub fn init() {

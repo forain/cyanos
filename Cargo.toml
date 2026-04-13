@@ -6,6 +6,8 @@ members = [
     "sched",
     "ipc",
     "drivers",
+    "drivers/usb",
+    "drivers/wifi",
     "boot",
     "lib",
     "arch/x86_64",

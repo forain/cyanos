@@ -1,0 +1,10 @@
+[package]
+name = "usb"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+los-lib = { path = "../../lib" }
+ipc     = { path = "../../ipc" }
+bitflags.workspace = true
+spin.workspace = true
