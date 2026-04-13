@@ -1,0 +1,51 @@
+# LOS build configuration
+#
+# Default target: AArch64 bare metal (matches the development device).
+# For x86-64:  cargo build --target x86_64-unknown-none
+#
+# Building requires nightly Rust + rust-src component:
+#   rustup toolchain install nightly
+#   rustup component add rust-src --toolchain nightly
+#   cargo +nightly build -Z build-std=core,compiler_builtins \
+#         -Z build-std-features=compiler-builtins-mem
+#
+# For `cargo check` during development (stable Rust, type-checks only):
+#   cargo check --target aarch64-linux-android
+
+[build]
+target = "aarch64-unknown-none"
+
+# ── QEMU test runners ─────────────────────────────────────────────────────────
+# `cargo run` will launch QEMU with the built kernel ELF.
+
+[target.aarch64-unknown-none]
+runner = [
+    "qemu-system-aarch64",
+    "-machine", "virt",
+    "-cpu", "cortex-a57",
+    "-m", "256M",
+    "-nographic",
+    "-serial", "mon:stdio",
+    "-kernel",
+]
+
+[target.x86_64-unknown-none]
+runner = [
+    "qemu-system-x86_64",
+    "-machine", "q35",
+    "-m", "256M",
+    "-nographic",
+    "-serial", "mon:stdio",
+    "-kernel",
+]
+
+# ── Linker flags shared by all bare-metal targets ────────────────────────────
+# The linker script is injected by kernel/build.rs per target architecture.
+# lld is used because it handles --entry and cross-linking reliably.
+
+[target.'cfg(target_os = "none")']
+rustflags = [
+    "-C", "linker=ld.lld",
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
+]

@@ -4,9 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-mm = { path = "../mm" }
+mm    = { path = "../mm" }
 sched = { path = "../sched" }
-ipc = { path = "../ipc" }
+ipc   = { path = "../ipc" }
+boot  = { path = "../boot" }
 los-lib = { path = "../lib" }
 bitflags.workspace = true
 spin.workspace = true
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+arch-x86_64 = { path = "../arch/x86_64" }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+arch-aarch64 = { path = "../arch/aarch64" }

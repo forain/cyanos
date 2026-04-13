@@ -52,7 +52,10 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "arch-aarch64",
+ "arch-x86_64",
  "bitflags",
+ "boot",
  "ipc",
  "los-lib",
  "mm",
@@ -81,6 +84,7 @@ name = "mm"
 version = "0.1.0"
 dependencies = [
  "bitflags",
+ "boot",
  "los-lib",
  "spin",
 ]

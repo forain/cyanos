@@ -18,10 +18,38 @@ impl FreeList {
 
 static FREE_LISTS: Mutex<[FreeList; MAX_ORDER]> = Mutex::new([const { FreeList::empty() }; MAX_ORDER]);
 
-/// Initialise the buddy allocator with the available physical memory map.
-/// Must be called before any allocation.
-pub fn init() {
-    // TODO: parse memory map from bootloader (e.g. multiboot2 / UEFI).
+/// Initialise the buddy allocator from the boot memory map.
+///
+/// Each Available region is broken into the largest possible order-aligned
+/// blocks and inserted into the free lists — mirroring `free_area_init` in
+/// Linux `mm/page_alloc.c`.
+pub fn init_from_map(regions: &[boot::MemoryRegion]) {
+    for region in regions {
+        if region.kind != boot::MemoryType::Available { continue; }
+        // Skip the first 2 MiB — reserved for kernel image, page tables, etc.
+        let start = los_lib::align_up(
+            region.base as usize,
+            PAGE_SIZE << (MAX_ORDER - 1),
+        );
+        let end = los_lib::align_down(
+            (region.base + region.length) as usize,
+            PAGE_SIZE,
+        );
+        if start >= end { continue; }
+
+        // Walk from start to end, releasing the largest aligned block each time.
+        let mut addr = start;
+        while addr < end {
+            let remaining_pages = (end - addr) / PAGE_SIZE;
+            let max_order = usize::min(MAX_ORDER - 1,
+                (usize::BITS - 1 - remaining_pages.leading_zeros()) as usize);
+            // Also constrain by alignment.
+            let align_order = (addr / PAGE_SIZE).trailing_zeros() as usize;
+            let order = usize::min(max_order, usize::min(align_order, MAX_ORDER - 1));
+            free(addr, order);
+            addr += PAGE_SIZE << order;
+        }
+    }
 }
 
 /// Allocate 2^order contiguous physical pages. Returns physical address or None.

@@ -13,8 +13,15 @@ pub mod paging;
 pub mod slab;
 pub mod vmm;
 
-/// Initialise all memory subsystems. Called once from `kernel_main`.
+/// Initialise all memory subsystems with a physical memory map.
+/// Called once from `kernel_main` after boot info is parsed.
+pub fn init_with_map(regions: &[boot::MemoryRegion]) {
+    buddy::init_from_map(regions);
+    slab::init();
+}
+
+/// Fallback init with no memory map (used in unit tests).
 pub fn init() {
-    buddy::init();
+    buddy::init_from_map(&[]);
     slab::init();
 }
