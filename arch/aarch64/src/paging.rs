@@ -33,7 +33,7 @@ pub unsafe fn map_4k(pgd: *mut u64, virt: usize, phys: usize, flags: PageDescFla
     p3.add(l3).write(phys as u64 | flags.bits() | 0b11);
 }
 
-unsafe fn ensure_table(parent: *mut u64, idx: usize, flags: PageDescFlags) -> *mut u64 {
+unsafe fn ensure_table(parent: *mut u64, idx: usize, _flags: PageDescFlags) -> *mut u64 {
     let entry = parent.add(idx).read();
     if entry & PageDescFlags::VALID.bits() != 0 {
         return (entry & 0x0000_FFFF_FFFF_F000) as *mut u64;

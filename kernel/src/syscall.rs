@@ -1,9 +1,10 @@
 //! Syscall dispatch — the only controlled gate into kernel space.
+#![allow(dead_code, unused_imports)]
 //!
 //! Like Linux, syscalls are numbered. Unlike a monolithic kernel, most
 //! work is delegated to user-space servers via IPC.
 
-use ipc::{Message, Port};
+use ipc::Message;
 
 /// Syscall numbers (ABI-stable once stabilised).
 #[repr(usize)]
@@ -23,7 +24,7 @@ pub fn dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> isize {
         n if n == Syscall::Send as usize   => sys_send(a0, a1, a2),
         n if n == Syscall::Recv as usize   => sys_recv(a0, a1),
         n if n == Syscall::Yield as usize  => { sched::r#yield(); 0 }
-        n if n == Syscall::Exit as usize   => { sched::exit(a0 as i32); unreachable!() }
+        n if n == Syscall::Exit as usize   => sched::exit(a0 as i32),
         _ => -1, // ENOSYS
     }
 }

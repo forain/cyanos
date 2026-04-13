@@ -43,7 +43,7 @@ pub fn init() {
     unsafe {
         // Install a generic fault handler for all exceptions.
         for i in 0..32usize {
-            IDT.0[i] = IdtEntry::new(generic_fault as usize, 0x08, 0, 0x8E);
+            IDT.0[i] = IdtEntry::new(generic_fault as *const () as usize, 0x08, 0, 0x8E);
         }
         let ptr = IdtPointer {
             limit: (size_of::<Idt>() - 1) as u16,
@@ -53,7 +53,13 @@ pub fn init() {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 extern "x86-interrupt" fn generic_fault(_frame: InterruptStackFrame) {
+    panic!("unhandled CPU exception");
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+extern "C" fn generic_fault(_frame: InterruptStackFrame) {
     panic!("unhandled CPU exception");
 }
 

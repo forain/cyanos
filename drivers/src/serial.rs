@@ -5,7 +5,7 @@ use super::{Driver, DriverError};
 const COM1: u16 = 0x3F8;
 
 pub struct Serial {
-    base: u16,
+    pub base: u16,
 }
 
 impl Serial {

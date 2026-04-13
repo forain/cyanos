@@ -29,18 +29,23 @@ impl RunQueue {
         false // queue full
     }
 
-    /// Pick the next ready task using round-robin.
-    pub fn pick_next(&mut self) -> Option<&mut Task> {
+    /// Pick the next ready task using round-robin. Returns its index.
+    pub fn pick_next(&mut self) -> Option<usize> {
         if self.len == 0 { return None; }
         for _ in 0..MAX_TASKS {
             self.cursor = (self.cursor + 1) % MAX_TASKS;
-            if let Some(task) = &mut self.tasks[self.cursor] {
+            let cursor = self.cursor;
+            if let Some(task) = &mut self.tasks[cursor] {
                 if task.state == TaskState::Ready {
                     task.state = TaskState::Running;
-                    return Some(task);
+                    return Some(cursor);
                 }
             }
         }
         None
+    }
+
+    pub fn get_mut(&mut self, idx: usize) -> Option<&mut Task> {
+        self.tasks[idx].as_mut()
     }
 }

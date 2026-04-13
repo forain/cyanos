@@ -9,7 +9,7 @@ pub mod task;
 pub mod runqueue;
 
 use spin::Mutex;
-use task::{Task, TaskState, Pid};
+use task::Pid;
 use runqueue::RunQueue;
 
 static RUN_QUEUE: Mutex<RunQueue> = Mutex::new(RunQueue::new());
@@ -23,9 +23,12 @@ pub fn init() {
 /// Enter the scheduler loop — never returns.
 pub fn run() -> ! {
     loop {
-        let maybe_task = RUN_QUEUE.lock().pick_next();
-        if let Some(_task) = maybe_task {
-            // TODO: context-switch to task.
+        let maybe_idx = {
+            let mut rq = RUN_QUEUE.lock();
+            rq.pick_next()
+        };
+        if let Some(_idx) = maybe_idx {
+            // TODO: context-switch to task at _idx.
         } else {
             // CPU idle — halt until next interrupt.
             core::hint::spin_loop();

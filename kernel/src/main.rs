@@ -6,7 +6,7 @@
 
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
 use core::panic::PanicInfo;
 
