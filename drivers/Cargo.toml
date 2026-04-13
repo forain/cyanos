@@ -1,0 +1,9 @@
+[package]
+name = "drivers"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+los-lib = { path = "../lib" }
+ipc = { path = "../ipc" }
+spin.workspace = true

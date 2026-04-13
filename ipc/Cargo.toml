@@ -1,0 +1,8 @@
+[package]
+name = "ipc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+los-lib = { path = "../lib" }
+spin.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "sched"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+los-lib = { path = "../lib" }
+mm = { path = "../mm" }
+spin.workspace = true

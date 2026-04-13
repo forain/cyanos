@@ -1,0 +1,20 @@
+[package]
+name = "kernel"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mm = { path = "../mm" }
+sched = { path = "../sched" }
+ipc = { path = "../ipc" }
+los-lib = { path = "../lib" }
+bitflags.workspace = true
+spin.workspace = true
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"

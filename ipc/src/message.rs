@@ -1,0 +1,23 @@
+//! Message format — fixed-size, zero-copy where possible.
+//!
+//! Small messages (≤ MESSAGE_INLINE_BYTES) are copied inline.
+//! Larger payloads use shared memory pages passed by capability.
+
+pub const MESSAGE_INLINE_BYTES: usize = 56;
+
+/// A kernel IPC message.
+#[derive(Clone, Copy)]
+pub struct Message {
+    /// Identifies the requested operation (server-defined).
+    pub tag: u64,
+    /// Inline payload for small messages.
+    pub data: [u8; MESSAGE_INLINE_BYTES],
+    /// Optional shared-memory capability for large payloads.
+    pub cap: Option<usize>,
+}
+
+impl Message {
+    pub const fn empty() -> Self {
+        Self { tag: 0, data: [0; MESSAGE_INLINE_BYTES], cap: None }
+    }
+}

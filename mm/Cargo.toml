@@ -1,0 +1,9 @@
+[package]
+name = "mm"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+los-lib = { path = "../lib" }
+bitflags.workspace = true
+spin.workspace = true
