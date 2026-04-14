@@ -1,5 +1,5 @@
 [package]
-name = "los-lib"
+name = "cyanos-lib"
 version.workspace = true
 edition.workspace = true
 

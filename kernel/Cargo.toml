@@ -8,7 +8,7 @@ mm    = { path = "../mm" }
 sched = { path = "../sched" }
 ipc   = { path = "../ipc" }
 boot  = { path = "../boot" }
-los-lib = { path = "../lib" }
+cyanos-lib = { path = "../lib" }
 bitflags.workspace = true
 spin.workspace = true
 

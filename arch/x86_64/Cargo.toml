@@ -4,6 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-los-lib = { path = "../../lib" }
+cyanos-lib = { path = "../../lib" }
 mm      = { path = "../../mm" }
 bitflags.workspace = true

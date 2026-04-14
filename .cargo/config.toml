@@ -1,4 +1,4 @@
-# LOS build configuration
+# Cyanos build configuration
 #
 # Default target: AArch64 bare metal (matches the development device).
 # For x86-64:  cargo build --target x86_64-unknown-none

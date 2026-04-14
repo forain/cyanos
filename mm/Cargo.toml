@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-los-lib = { path = "../lib" }
+cyanos-lib = { path = "../lib" }
 boot    = { path = "../boot" }
 bitflags.workspace = true
 spin.workspace = true

@@ -1,4 +1,4 @@
-//! LOS kernel entry point.
+//! Cyanos kernel entry point.
 //!
 //! `kernel_main` is called by the arch-specific `_start` stub (entry_*.s)
 //! after the stack is set up and BSS is zeroed.  It receives the physical
@@ -114,7 +114,7 @@ fn print_hex(mut n: u64) {
 pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // 1. Initialise serial UART as early as possible (needed by panic handler).
     unsafe { early_serial_init(); }
-    serial_print("\n[LOS] kernel_main — starting\n");
+    serial_print("\n[CYANOS] kernel_main — starting\n");
 
     // 2. Initialise architecture-specific hardware (GDT/IDT on x86, vectors on AArch64).
     #[cfg(target_arch = "x86_64")]
@@ -130,7 +130,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
         { boot::device_tree::parse(boot_info_addr) }
     };
 
-    serial_print("[LOS] memory map: ");
+    serial_print("[CYANOS] memory map: ");
     print_hex(boot_info.total_available_memory());
     serial_print(" bytes available\n");
 
@@ -146,14 +146,14 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // 7. Spawn PID-1 init task.
     match sched::spawn(init::init_task_main, 0) {
         Some(pid) => {
-            serial_print("[LOS] init task spawned, PID ");
+            serial_print("[CYANOS] init task spawned, PID ");
             print_hex(pid as u64);
             serial_print("\n");
         }
         None => panic!("kernel_main: failed to spawn init task"),
     }
 
-    serial_print("[LOS] subsystems initialised — entering scheduler\n");
+    serial_print("[CYANOS] subsystems initialised — entering scheduler\n");
 
     // 8. Hand off to the scheduler.  Never returns.
     sched::run()
@@ -163,7 +163,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial_print("\n[LOS] KERNEL PANIC");
+    serial_print("\n[CYANOS] KERNEL PANIC");
 
     if let Some(loc) = info.location() {
         serial_print(" at ");
@@ -177,7 +177,7 @@ fn panic(info: &PanicInfo) -> ! {
         serial_print(msg);
     }
 
-    serial_print("\n[LOS] halted.\n");
+    serial_print("\n[CYANOS] halted.\n");
 
     loop {
         core::hint::spin_loop();
