@@ -1,57 +1,170 @@
-//! Scheduler — preemptive, priority-based task scheduler.
+//! Cooperative scheduler — context switching, task lifecycle, IPC blocking.
 //!
-//! Inspired by Linux CFS but simplified for a microkernel where most work
-//! is IPC-driven, not CPU-bound.
+//! Design: single-CPU, cooperative.  Tasks run until they call `yield_now()`,
+//! `block_on()`, or `exit()`.  A static idle context in `run()` is the
+//! "scheduler thread" that picks the next ready task on each wake-up.
+//!
+//! Analogues: Linux kernel/sched/core.c (`schedule`, `switch_to`).
 
 #![no_std]
 
-pub mod task;
+pub mod context;
 pub mod runqueue;
+pub mod task;
 
 use spin::Mutex;
-use task::Pid;
+use task::{Pid, Task, TaskState};
+use context::CpuContext;
 use runqueue::RunQueue;
 
 static RUN_QUEUE: Mutex<RunQueue> = Mutex::new(RunQueue::new());
-static NEXT_PID: spin::Mutex<Pid> = spin::Mutex::new(1);
+static NEXT_PID:  Mutex<Pid>     = Mutex::new(1);
 
-/// Initialise the scheduler. Called once from `kernel_main`.
+// ── Single-CPU scheduler state ────────────────────────────────────────────
+// Touched only while the single CPU is in scheduler context — no lock needed.
+
+/// Saved register state for the scheduler idle loop.
+static mut SCHEDULER_CTX: CpuContext = CpuContext::zeroed();
+
+/// Raw pointer to the currently-running task's `CpuContext`.
+/// Non-null only while a task is active on the CPU.
+static mut CURRENT_CTX: *mut CpuContext = core::ptr::null_mut();
+
+/// PID of the currently-running task (0 = scheduler idle).
+static mut CURRENT_PID: Pid = 0;
+
+// ── Public API ────────────────────────────────────────────────────────────
+
+/// Initialise the scheduler.  Called once from `kernel_main`.
 pub fn init() {
-    // Nothing to do yet; RunQueue is statically initialised.
+    // RunQueue is statically initialised; nothing to do here yet.
 }
 
-/// Enter the scheduler loop — never returns.
+/// Spawn a new kernel-mode task.
+///
+/// `entry` must be a `fn() -> !`; the task runs until it calls `exit()`.
+/// Returns the new task's PID, or `None` if the run queue is full.
+pub fn spawn(entry: fn() -> !, priority: i8) -> Option<Pid> {
+    // Allocate an 8 KiB kernel stack (order 1 = 2 × PAGE_SIZE).
+    let stack_base = mm::buddy::alloc(1)?;
+    let stack_size = mm::buddy::PAGE_SIZE * 2;
+
+    // Zero the stack — alloc returns a physical address; with no MMU (AArch64)
+    // or identity mapping (x86-64) this is directly writeable.
+    unsafe { (stack_base as *mut u8).write_bytes(0, stack_size); }
+
+    let pid  = alloc_pid();
+    let mut t = Task::new_kernel(pid, entry as usize, stack_base, stack_size, 0);
+    t.priority = priority;
+
+    if RUN_QUEUE.lock().enqueue(t) {
+        Some(pid)
+    } else {
+        // TODO: free stack on failure
+        None
+    }
+}
+
+/// Enter the scheduler run loop.  Never returns.
 pub fn run() -> ! {
     loop {
-        let maybe_idx = {
-            let mut rq = RUN_QUEUE.lock();
-            rq.pick_next()
-        };
-        if let Some(_idx) = maybe_idx {
-            // TODO: context-switch to task at _idx.
+        let maybe_idx = { RUN_QUEUE.lock().pick_next() };
+
+        if let Some(idx) = maybe_idx {
+            // Grab a raw pointer to the task's context and its PID,
+            // then drop the lock before switching.
+            let (ctx_ptr, pid) = {
+                let mut rq = RUN_QUEUE.lock();
+                let t = rq.get_mut(idx).unwrap();
+                (&mut t.ctx as *mut CpuContext, t.pid)
+            };
+
+            unsafe {
+                CURRENT_CTX = ctx_ptr;
+                CURRENT_PID = pid;
+                // Switch to the task.  Returns here when the task yields back.
+                context::cpu_switch_to(
+                    core::ptr::addr_of_mut!(SCHEDULER_CTX),
+                    ctx_ptr as *const CpuContext,
+                );
+                CURRENT_CTX = core::ptr::null_mut();
+                CURRENT_PID = 0;
+            }
+
+            // Task yielded: reset to Ready if it hasn't changed state itself
+            // (block_on/exit set the state before switching back).
+            {
+                let mut rq = RUN_QUEUE.lock();
+                if let Some(t) = rq.get_mut(idx) {
+                    if t.state == TaskState::Running {
+                        t.state = TaskState::Ready;
+                    }
+                }
+            }
         } else {
-            // CPU idle — halt until next interrupt.
+            // No runnable task — wait for an interrupt to make one ready.
             core::hint::spin_loop();
         }
     }
 }
 
-/// Yield the current task's remaining timeslice.
-pub fn r#yield() {
-    // TODO: trigger reschedule.
+/// Voluntarily yield the rest of this task's time-slice.
+///
+/// The task remains Ready and will be scheduled again on the next pass.
+pub fn yield_now() {
+    unsafe {
+        let ctx = CURRENT_CTX;
+        if !ctx.is_null() {
+            context::cpu_switch_to(ctx, core::ptr::addr_of!(SCHEDULER_CTX));
+        }
+    }
+}
+
+/// Block the current task until a message is sent to `port`.
+///
+/// The task's state is set to `Blocked` before switching to the scheduler.
+/// `ipc::port::send` calls `unblock_port` to wake it.
+pub fn block_on(port: u32) {
+    unsafe {
+        let pid = CURRENT_PID;
+        { RUN_QUEUE.lock().block_on_port(pid, port); }
+        let ctx = CURRENT_CTX;
+        if !ctx.is_null() {
+            context::cpu_switch_to(ctx, core::ptr::addr_of!(SCHEDULER_CTX));
+        }
+    }
+}
+
+/// Wake all tasks that are blocked on `port`.
+///
+/// Called by `ipc::port::send` after enqueueing a message.
+pub fn unblock_port(port: u32) {
+    RUN_QUEUE.lock().unblock_port(port);
 }
 
 /// Terminate the current task with the given exit code.
 pub fn exit(code: i32) -> ! {
     let _ = code;
-    // TODO: clean up task, wake any waiters, schedule next.
+    unsafe {
+        let pid = CURRENT_PID;
+        { RUN_QUEUE.lock().mark_zombie(pid); }
+        let ctx = CURRENT_CTX;
+        if !ctx.is_null() {
+            context::cpu_switch_to(ctx, core::ptr::addr_of!(SCHEDULER_CTX));
+        }
+    }
+    // Unreachable: the scheduler will never switch back to a Zombie task.
     loop { core::hint::spin_loop(); }
 }
 
+/// Backward-compatible alias used by the syscall dispatch table.
+#[inline]
+pub fn r#yield() { yield_now(); }
+
 /// Allocate the next available PID.
 pub fn alloc_pid() -> Pid {
-    let mut pid = NEXT_PID.lock();
-    let p = *pid;
-    *pid += 1;
+    let mut n = NEXT_PID.lock();
+    let p = *n;
+    *n += 1;
     p
 }

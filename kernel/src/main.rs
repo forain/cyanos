@@ -10,6 +10,7 @@
 
 use core::panic::PanicInfo;
 
+mod init;
 mod syscall;
 
 // ── Architecture-specific boot stubs ─────────────────────────────────────────
@@ -142,9 +143,19 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // 6. Initialise the IPC subsystem.
     ipc::init();
 
+    // 7. Spawn PID-1 init task.
+    match sched::spawn(init::init_task_main, 0) {
+        Some(pid) => {
+            serial_print("[LOS] init task spawned, PID ");
+            print_hex(pid as u64);
+            serial_print("\n");
+        }
+        None => panic!("kernel_main: failed to spawn init task"),
+    }
+
     serial_print("[LOS] subsystems initialised — entering scheduler\n");
 
-    // 7. Hand off to the scheduler.  Never returns.
+    // 8. Hand off to the scheduler.  Never returns.
     sched::run()
 }
 

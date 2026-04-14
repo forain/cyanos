@@ -5,4 +5,5 @@ edition.workspace = true
 
 [dependencies]
 los-lib = { path = "../lib" }
+sched   = { path = "../sched" }
 spin.workspace = true

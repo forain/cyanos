@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "los-lib",
+ "mm",
 ]
 
 [[package]]
@@ -16,6 +17,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "los-lib",
+ "mm",
 ]
 
 [[package]]
@@ -45,6 +47,7 @@ name = "ipc"
 version = "0.1.0"
 dependencies = [
  "los-lib",
+ "sched",
  "spin",
 ]
 
