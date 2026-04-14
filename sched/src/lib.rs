@@ -12,13 +12,15 @@ pub mod context;
 pub mod runqueue;
 pub mod task;
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use task::{Pid, Task, TaskState};
 use context::CpuContext;
 use runqueue::RunQueue;
 
-static RUN_QUEUE: Mutex<RunQueue> = Mutex::new(RunQueue::new());
-static NEXT_PID:  Mutex<Pid>     = Mutex::new(1);
+static RUN_QUEUE:    Mutex<RunQueue> = Mutex::new(RunQueue::new());
+static NEXT_PID:     Mutex<Pid>     = Mutex::new(1);
+static TIMER_TICKS:  AtomicU64      = AtomicU64::new(0);
 
 // ── Single-CPU scheduler state ────────────────────────────────────────────
 // Touched only while the single CPU is in scheduler context — no lock needed.
@@ -155,6 +157,42 @@ pub fn exit(code: i32) -> ! {
     }
     // Unreachable: the scheduler will never switch back to a Zombie task.
     loop { core::hint::spin_loop(); }
+}
+
+/// Called from the timer ISR on every hardware tick.
+///
+/// Uses only atomics — safe to call from interrupt context without locks.
+/// Currently increments the tick counter and may be extended to set a
+/// preemption flag or wake sleeping tasks.
+pub fn timer_tick_irq() {
+    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Return the number of timer ticks elapsed since boot.
+#[inline]
+pub fn ticks() -> u64 {
+    TIMER_TICKS.load(Ordering::Relaxed)
+}
+
+/// Spawn a user-mode task (AArch64 only).
+///
+/// Allocates an 8 KiB kernel stack, builds the `ret_to_user` frame, and
+/// enqueues the task as Ready.  Returns the new PID on success.
+#[cfg(target_arch = "aarch64")]
+pub fn spawn_user(user_entry: usize, user_stack_top: usize, priority: i8) -> Option<Pid> {
+    let stack_base = mm::buddy::alloc(1)?;
+    let stack_size = mm::buddy::PAGE_SIZE * 2;
+    unsafe { (stack_base as *mut u8).write_bytes(0, stack_size); }
+
+    let pid             = alloc_pid();
+    let kernel_stack_top = stack_base + stack_size;
+    let ctx = CpuContext::new_user_task(user_entry, user_stack_top, kernel_stack_top);
+
+    let mut t = Task::new_kernel(pid, 0, stack_base, stack_size, 0);
+    t.ctx      = ctx;
+    t.priority = priority;
+
+    if RUN_QUEUE.lock().enqueue(t) { Some(pid) } else { None }
 }
 
 /// Backward-compatible alias used by the syscall dispatch table.

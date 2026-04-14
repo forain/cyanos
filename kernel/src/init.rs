@@ -24,19 +24,25 @@ pub fn init_task_main() -> ! {
                 None    => serial_print("[LOS] init: IPC loopback FAILED — no message\n"),
             }
 
-            // Enter a blocking event loop: wait for more messages.
-            // (Nothing else sends to us right now, so we just yield forever.)
+            // Enter an event loop: service messages and print a heartbeat every
+            // 100 ticks (≈1 s at 100 Hz) so we can confirm the timer fires.
             serial_print("[LOS] init: entering event loop\n");
+            let mut last_heartbeat: u64 = 0;
             loop {
-                match ipc::port::recv(port) {
-                    Some(_msg) => {
-                        serial_print("[LOS] init: message received\n");
-                    }
-                    None => {
-                        // No message — block until something sends to our port.
-                        sched::block_on(port);
-                    }
+                // Service all pending messages without blocking.
+                while let Some(_msg) = ipc::port::recv(port) {
+                    serial_print("[LOS] init: message received\n");
                 }
+
+                // Heartbeat: print once per second.
+                let t = sched::ticks();
+                if t.wrapping_sub(last_heartbeat) >= 100 {
+                    last_heartbeat = t;
+                    serial_print("[LOS] init: heartbeat\n");
+                }
+
+                // Yield rather than hard-block so the tick check above can fire.
+                sched::yield_now();
             }
         }
         None => {

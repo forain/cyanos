@@ -77,6 +77,32 @@ impl CpuContext {
             Self { rsp: frame as u64 }
         }
     }
+
+    /// Build a context for a new user-mode task (AArch64 only).
+    ///
+    /// When the scheduler first switches to this task, `cpu_switch_to` loads
+    /// x30 = `ret_to_user` and branches there via `ret`.  `ret_to_user` then
+    /// pops the three words below off the kernel stack and `eret`s to EL0.
+    ///
+    /// Kernel stack frame layout built here (from `kernel_stack_top - 24`):
+    ///   [ksp+0]:  SP_EL0   = user stack pointer
+    ///   [ksp+8]:  ELR_EL1  = user entry point
+    ///   [ksp+16]: SPSR_EL1 = 0 (EL0t, all interrupts unmasked)
+    #[cfg(target_arch = "aarch64")]
+    pub fn new_user_task(user_entry: usize, user_sp: usize, kernel_stack_top: usize) -> Self {
+        extern "C" { fn ret_to_user(); }
+        let frame = kernel_stack_top.wrapping_sub(3 * 8);
+        unsafe {
+            let p = frame as *mut u64;
+            p.add(0).write(user_sp as u64);       // SP_EL0
+            p.add(1).write(user_entry as u64);    // ELR_EL1
+            p.add(2).write(0u64);                 // SPSR_EL1 = EL0t
+        }
+        let mut c = Self::zeroed();
+        c.gregs[11] = ret_to_user as *const () as u64; // x30 → ret_to_user trampoline
+        c.sp        = frame as u64;
+        c
+    }
 }
 
 extern "C" {
