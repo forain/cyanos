@@ -19,6 +19,7 @@ dependencies = [
  "bitflags",
  "cyanos-lib",
  "mm",
+ "sched",
 ]
 
 [[package]]
@@ -68,10 +69,13 @@ dependencies = [
  "bitflags",
  "boot",
  "cyanos-lib",
+ "drivers",
  "ipc",
  "mm",
  "sched",
  "spin",
+ "usb",
+ "wifi",
 ]
 
 [[package]]
@@ -124,6 +128,7 @@ dependencies = [
  "bitflags",
  "cyanos-lib",
  "ipc",
+ "mm",
  "spin",
 ]
 

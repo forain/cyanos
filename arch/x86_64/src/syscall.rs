@@ -19,11 +19,27 @@
 //!   RSI = a0     (from RDI)
 //!   RDX = a1     (from RSI)
 //!   RCX = a2     (from RDX)
+//!
+//! # Per-CPU stacks and SWAPGS
+//!
+//! The old implementation used a single global `_syscall_user_rsp` save-slot
+//! and a single `_syscall_stack`, both SMP-unsafe.
+//!
+//! The new implementation uses per-CPU data accessed via the GS segment:
+//!   - Each CPU has a `PerCpuSyscall` struct with a private kernel stack top
+//!     and a user-RSP save slot.
+//!   - `IA32_KERNEL_GS_BASE` MSR is set to point to that struct.
+//!   - On SYSCALL entry `swapgs` activates kernel GS (→ per-CPU struct);
+//!     on SYSRET `swapgs` restores user GS.
+//!
+//! `init()` calls `init_per_cpu(0)` for the BSP.
+//! `init_ap()` is called by each AP in `smp::sched_ap_entry` after LAPIC init.
 
-const MSR_EFER:  u32 = 0xC000_0080;
-const MSR_STAR:  u32 = 0xC000_0081;
-const MSR_LSTAR: u32 = 0xC000_0082;
-const MSR_FMASK: u32 = 0xC000_0084;
+const MSR_EFER:         u32 = 0xC000_0080;
+const MSR_STAR:         u32 = 0xC000_0081;
+const MSR_LSTAR:        u32 = 0xC000_0082;
+const MSR_FMASK:        u32 = 0xC000_0084;
+const MSR_KERNEL_GSBASE: u32 = 0xC000_0102;
 
 unsafe fn rdmsr(msr: u32) -> u64 {
     let lo: u32;
@@ -33,7 +49,7 @@ unsafe fn rdmsr(msr: u32) -> u64 {
         in("ecx")  msr,
         out("eax") lo,
         out("edx") hi,
-        options(nomem, nostack)
+        options(nomem, nostack, preserves_flags)
     );
     (hi as u64) << 32 | lo as u64
 }
@@ -44,11 +60,54 @@ unsafe fn wrmsr(msr: u32, val: u64) {
         in("ecx")  msr,
         in("eax")  val as u32,
         in("edx")  (val >> 32) as u32,
-        options(nomem, nostack)
+        options(nomem, nostack, preserves_flags)
     );
 }
 
-/// Configure SYSCALL/SYSRET MSRs and point the handler at `syscall_entry`.
+// ── Per-CPU SYSCALL data ──────────────────────────────────────────────────────
+
+/// Number of CPUs supported (must match `sched::MAX_CPUS`).
+const MAX_CPUS:   usize = 8;
+/// Size of each CPU's private SYSCALL kernel stack.
+const STACK_SIZE: usize = 16 * 1024; // 16 KiB
+
+/// Per-CPU metadata accessed via GS during the SYSCALL path.
+///
+/// Field offsets are part of the assembly ABI:
+///   offset 0  (`gs:0`)  — `kernel_stack_top`: kernel RSP to load on entry.
+///   offset 8  (`gs:8`)  — `user_rsp_save`:    slot for the user RSP.
+#[repr(C)]
+struct PerCpuSyscall {
+    kernel_stack_top: u64,
+    user_rsp_save:    u64,
+}
+
+/// Static kernel stacks, one per CPU (placed in .bss, zero-initialized).
+static mut SYSCALL_STACKS: [[u8; STACK_SIZE]; MAX_CPUS] = [[0u8; STACK_SIZE]; MAX_CPUS];
+
+/// Per-CPU SYSCALL metadata (KERNEL_GS_BASE points here for each CPU).
+static mut PER_CPU: [PerCpuSyscall; MAX_CPUS] =
+    [const { PerCpuSyscall { kernel_stack_top: 0, user_rsp_save: 0 } }; MAX_CPUS];
+
+/// Initialise the per-CPU SYSCALL state for `cpu_id`.
+///
+/// Sets `PER_CPU[cpu_id].kernel_stack_top` to the top of the static stack
+/// for that CPU, then writes the address of `PER_CPU[cpu_id]` into the
+/// `IA32_KERNEL_GS_BASE` MSR so that `swapgs` on SYSCALL entry makes
+/// GS point directly to the per-CPU struct.
+fn init_per_cpu(cpu_id: usize) {
+    let idx = cpu_id.min(MAX_CPUS - 1);
+    unsafe {
+        // Stack grows downward; top = base + size.
+        let stack_top = SYSCALL_STACKS[idx].as_ptr().add(STACK_SIZE) as u64;
+        PER_CPU[idx].kernel_stack_top = stack_top;
+
+        let per_cpu_ptr = core::ptr::addr_of!(PER_CPU[idx]) as u64;
+        wrmsr(MSR_KERNEL_GSBASE, per_cpu_ptr);
+    }
+}
+
+/// Configure SYSCALL/SYSRET MSRs and initialise per-CPU state for the BSP (CPU 0).
 pub fn init() {
     unsafe {
         // Enable SCE (System Call Extensions) in EFER.
@@ -65,27 +124,42 @@ pub fn init() {
         // FMASK: clear IF (bit 9) on SYSCALL so we run with interrupts disabled.
         wrmsr(MSR_FMASK, 1 << 9);
     }
+
+    // BSP is CPU 0.
+    init_per_cpu(0);
 }
 
-// ── SYSCALL entry trampoline (AT&T syntax) ────────────────────────────────────
+/// Initialise per-CPU SYSCALL state for an Application Processor.
+///
+/// Must be called after `apic::init()` (so `arch_cpu_id()` returns the
+/// correct LAPIC-derived CPU index).  Called from `smp::sched_ap_entry`.
+pub fn init_ap() {
+    let cpu_id = unsafe { crate::smp::arch_cpu_id() };
+    init_per_cpu(cpu_id);
+}
+
+// ── SYSCALL entry trampoline ──────────────────────────────────────────────────
 //
-// Uses a per-kernel static 16 KiB stack (_syscall_stack_bytes / _syscall_stack_top)
-// and a single-word save area (_syscall_user_rsp) for the user RSP.
-// Safe because FMASK disables interrupts and we are single-CPU.
+// Uses per-CPU stacks and save slots accessed through the GS segment.
+// FMASK clears IF on SYSCALL so no maskable interrupt can fire between
+// swapgs and the callq, preventing GS from being in an inconsistent state.
 
 core::arch::global_asm!(r#"
 .global syscall_entry
 .type   syscall_entry, @function
 syscall_entry:
-    // 1. Save user RSP; switch to the kernel SYSCALL stack.
-    movq  %rsp, _syscall_user_rsp(%rip)
-    leaq  _syscall_stack_top(%rip), %rsp
+    // 1. Activate kernel GS (IA32_KERNEL_GS_BASE → GS; user GS stashed).
+    swapgs
 
-    // 2. Preserve user RIP (rcx) and user RFLAGS (r11) across the dispatch call.
-    pushq %r11
-    pushq %rcx
+    // 2. Save user RSP; switch to this CPU's kernel SYSCALL stack.
+    movq  %rsp, %gs:8    // PerCpuSyscall.user_rsp_save = user RSP
+    movq  %gs:0, %rsp    // RSP = PerCpuSyscall.kernel_stack_top
 
-    // 3. Rearrange registers for System V C calling convention:
+    // 3. Preserve caller-saved regs clobbered by the C call.
+    pushq %r11            // user RFLAGS (written by SYSCALL)
+    pushq %rcx            // user RIP    (written by SYSCALL)
+
+    // 4. Rearrange registers for System V C calling convention:
     //    syscall_dispatch(number:rdi, a0:rsi, a1:rdx, a2:rcx)
     //    On entry: rax=number, rdi=a0, rsi=a1, rdx=a2
     movq  %rdx, %rcx    // a2 → rcx  (save before rdx is overwritten)
@@ -95,26 +169,16 @@ syscall_entry:
     callq syscall_dispatch
     // rax = return value (isize) — left in rax for SYSRET.
 
-    // 4. Restore user RIP and RFLAGS; SYSRET will put them back.
-    popq  %rcx          // user RIP   → rcx
-    popq  %r11          // user RFLAGS → r11
+    // 5. Restore saved regs.
+    popq  %rcx            // user RIP   → rcx
+    popq  %r11            // user RFLAGS → r11
 
-    // 5. Restore user RSP and return to user space.
-    movq  _syscall_user_rsp(%rip), %rsp
-    sysretq             // CS=0x23, SS=0x1B, RIP=rcx, RFLAGS=r11
+    // 6. Restore user RSP and deactivate kernel GS.
+    movq  %gs:8, %rsp
+    swapgs
 
-// ── Static data: kernel SYSCALL stack (16 KiB) and user-RSP save slot ───────
-
-.section .bss
-.balign 16
-_syscall_stack_bytes:
-    .skip 16384
-_syscall_stack_top:
-
-.section .data
-.balign 8
-_syscall_user_rsp:
-    .quad 0
+    // 7. Return to user space.
+    sysretq
 "#);
 
 extern "C" {

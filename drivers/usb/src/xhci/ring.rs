@@ -209,6 +209,11 @@ impl Ring {
         core::ptr::addr_of!(self.trbs[self.enq]) as u64
     }
 
+    /// Physical address of the current dequeue pointer (used to update ERDP).
+    pub fn deq_phys(&self) -> u64 {
+        core::ptr::addr_of!(self.trbs[self.deq]) as u64
+    }
+
     /// Enqueue a TRB, advancing the enqueue pointer and toggling PCS at LINK.
     pub fn enqueue(&mut self, mut trb: Trb) {
         // Set cycle bit to current PCS.
@@ -226,19 +231,28 @@ impl Ring {
         }
     }
 
-    /// Dequeue an event TRB if its cycle bit matches CCS.
-    /// Returns `None` if the ring has no new events.
+    /// Dequeue the next event TRB whose cycle bit matches CCS.
+    ///
+    /// LINK TRBs are skipped automatically — they are bookkeeping entries that
+    /// should never be presented as events to the caller.  Returns `None` when
+    /// no new events are available.
     pub fn dequeue_event(&mut self) -> Option<Trb> {
-        let trb = self.trbs[self.deq];
-        if trb.cycle_bit() != self.ccs { return None; }
+        loop {
+            let trb = self.trbs[self.deq];
+            if trb.cycle_bit() != self.ccs { return None; }
 
-        let result = trb;
-        self.deq += 1;
-        if self.deq == TRBS_PER_SEGMENT - 1 {
-            self.deq = 0;
-            self.ccs = !self.ccs;
+            // Advance the dequeue pointer, wrapping at the LINK TRB slot.
+            self.deq += 1;
+            if self.deq == TRBS_PER_SEGMENT - 1 {
+                self.deq = 0;
+                self.ccs = !self.ccs;
+            }
+
+            // Skip LINK TRBs — the HC may produce them during ring management.
+            if trb.trb_type() == TrbType::Link as u8 { continue; }
+
+            return Some(trb);
         }
-        Some(result)
     }
 
     pub fn is_empty(&self) -> bool { self.enq == self.deq }

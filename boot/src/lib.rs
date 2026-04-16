@@ -6,6 +6,7 @@
 #![no_std]
 
 pub mod device_tree;
+pub mod limine;
 pub mod multiboot2;
 
 // ── Memory map types ─────────────────────────────────────────────────────────
@@ -46,6 +47,8 @@ pub struct BootInfo {
     pub framebuffer_pitch:   u32,
     /// ACPI Root System Description Pointer (0 if not present).
     pub rsdp_addr:           u64,
+    /// UART MMIO base address discovered from DTB (0 if not found / not a DTB boot).
+    pub uart_base:           u64,
 }
 
 // SAFETY: the BootInfo struct is set up once by the entry stub before any

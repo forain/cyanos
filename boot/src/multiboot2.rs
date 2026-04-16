@@ -77,6 +77,7 @@ pub unsafe fn parse(mbi_phys: usize) -> BootInfo {
         framebuffer_height:  0,
         framebuffer_pitch:   0,
         rsdp_addr:           0,
+        uart_base:           0,
     };
 
     // MBI starts with total_size (u32) + reserved (u32), then tags.
@@ -102,6 +103,9 @@ pub unsafe fn parse(mbi_phys: usize) -> BootInfo {
             t if t == TagType::MemoryMap as u32 => {
                 // Tag layout: header(8) + entry_size(4) + entry_version(4) + entries
                 let entry_size = *((mbi_phys + offset + 8) as *const u32) as usize;
+                // Guard: entry_size == 0 would make eoff never advance → infinite loop.
+                // The spec requires entry_size >= 24; skip the tag if malformed.
+                if entry_size == 0 { break; }
                 let mut eoff = offset + 16;
                 while eoff + entry_size <= offset + size {
                     let e = (mbi_phys + eoff) as *const MbiMemMapEntry;

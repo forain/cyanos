@@ -12,3 +12,4 @@ pub mod cfg80211;
 pub mod ieee80211;
 pub mod mac80211;
 pub mod nl80211;
+pub mod virtio_wifi;

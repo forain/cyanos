@@ -2,9 +2,42 @@
 //!
 //! Handles received beacon / probe response frames and builds the BSS list.
 
+use spin::Mutex;
 use crate::ieee80211::{IeIter, eid, Channel, Band, ChannelFlags};
-use crate::cfg80211::{Bss, Ssid};
+use crate::cfg80211::{Bss, Ssid, ScanResults};
 use super::{Mac80211, Ieee80211Ops};
+
+// ── Scan result cache ─────────────────────────────────────────────────────────
+//
+// BSS entries discovered via beacons/probe-responses are stored here.
+// cfg80211 / nl80211 queries this table when the scan completes.
+
+static SCAN_CACHE: Mutex<ScanResults> = Mutex::new(ScanResults {
+    bss:     [None; 32],
+    count:   0,
+    aborted: false,
+});
+
+/// Return the number of cached BSS entries.
+pub fn cached_count() -> u8 {
+    SCAN_CACHE.lock().count
+}
+
+/// Drain the cache: take all entries and reset it.
+///
+/// Intended to be called once by nl80211 after a scan completes.
+pub fn take_results() -> ScanResults {
+    let mut cache = SCAN_CACHE.lock();
+    let out = ScanResults {
+        bss:     cache.bss,
+        count:   cache.count,
+        aborted: cache.aborted,
+    };
+    cache.bss     = [None; 32];
+    cache.count   = 0;
+    cache.aborted = false;
+    out
+}
 
 /// Parse a received Beacon or Probe Response and upsert a BSS entry.
 ///
@@ -34,8 +67,7 @@ pub fn handle_beacon_or_probe<D: Ieee80211Ops>(_mac: &mut Mac80211<D>, frame: &[
         }
     }
 
-    // Build a minimal Channel descriptor.  In real mac80211 the channel is
-    // looked up from the hardware's supported channel list.
+    // Build a minimal Channel descriptor.
     let channel = Channel {
         band:     Band::Ghz2,
         center_freq: ds_channel.map(|c| 2407 + c as u32 * 5).unwrap_or(2412),
@@ -56,8 +88,6 @@ pub fn handle_beacon_or_probe<D: Ieee80211Ops>(_mac: &mut Mac80211<D>, frame: &[
         age_ms: 0,
     };
 
-    // In real mac80211 the result is forwarded to cfg80211 which maintains
-    // a kernel-managed BSS table.  Here we just hand it to the scan state.
-    // (The real driver calls cfg80211_inform_bss_frame_data.)
-    let _ = bss; // TODO: store in scan result cache
+    // Store in the scan cache; drop silently if the cache is full.
+    SCAN_CACHE.lock().add(bss);
 }

@@ -10,10 +10,14 @@ pub mod port;
 pub mod message;
 pub mod channel;
 
-pub use port::Port;
+pub use port::{Port, SendError};
 pub use message::{Message, MESSAGE_INLINE_BYTES};
+pub use channel::Channel;
 
 /// Initialise the IPC subsystem. Called once from `kernel_main`.
 pub fn init() {
     port::init();
+    // Register cleanup callback so the scheduler can release ports when a
+    // task exits, without creating a sched→ipc dependency cycle.
+    sched::set_task_exit_hook(port::release_by_owner);
 }

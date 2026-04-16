@@ -87,6 +87,14 @@ struct GdtPointer { limit: u16, base: u64 }
 
 pub static mut TSS: Tss = Tss::new();
 
+/// Dedicated stack for the double-fault IST entry (IST1 = TSS.ist[0]).
+///
+/// A double fault is typically caused by a stack-overflow or a GP fault during
+/// exception handling.  Without a separate IST stack, the double-fault handler
+/// would execute on the same (possibly corrupted/exhausted) stack and
+/// immediately triple-fault.  4 KiB is sufficient for the minimal handler.
+static mut DOUBLE_FAULT_STACK: [u8; 4096] = [0u8; 4096];
+
 static mut GDT: Gdt = Gdt {
     null:        GdtEntry(0),
     kernel_code: GdtEntry(0x00AF_9A00_0000_FFFF), // 64-bit code, DPL 0
@@ -98,6 +106,11 @@ static mut GDT: Gdt = Gdt {
 
 pub fn init() {
     unsafe {
+        // IST1 (TSS.ist[0]) — dedicated double-fault stack.
+        // The stack grows downward; the top is the end of the array.
+        TSS.ist[0] = (core::ptr::addr_of!(DOUBLE_FAULT_STACK) as usize
+            + core::mem::size_of::<[u8; 4096]>()) as u64;
+
         // Patch the TSS descriptor with the runtime address of TSS.
         let tss_base  = core::ptr::addr_of!(TSS) as u64;
         let tss_limit = (size_of::<Tss>() - 1) as u32;
@@ -137,4 +150,11 @@ pub fn init() {
 /// user task so that ring-0 exceptions use the correct kernel stack.
 pub fn set_kernel_stack(rsp: u64) {
     unsafe { TSS.rsp0 = rsp; }
+}
+
+/// C-callable wrapper used by `sched` (which cannot depend on this crate
+/// directly).  Resolved at link time via the linker.
+#[no_mangle]
+pub unsafe extern "C" fn arch_set_kernel_stack(rsp: u64) {
+    set_kernel_stack(rsp);
 }

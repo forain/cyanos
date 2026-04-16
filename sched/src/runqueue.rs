@@ -29,17 +29,31 @@ impl RunQueue {
         false
     }
 
-    /// Pick the next Ready task (round-robin). Marks it Running.
+    /// Pick the next Ready task using priority scheduling.
+    ///
+    /// Selects the highest-priority Ready task (largest `Task::priority` value).
+    /// Among tasks with equal priority, round-robin order (cursor) breaks ties
+    /// so no task of equal priority starves.  Marks the chosen task Running.
     /// Returns the slot index so the caller can track which task is active.
     pub fn pick_next(&mut self) -> Option<usize> {
         if self.len == 0 { return None; }
-        for _ in 0..MAX_TASKS {
-            self.cursor = (self.cursor + 1) % MAX_TASKS;
-            let c = self.cursor;
-            if let Some(task) = &mut self.tasks[c] {
-                if task.state == TaskState::Ready {
-                    task.state = TaskState::Running;
-                    return Some(c);
+
+        // Pass 1: find the maximum priority among all Ready tasks.
+        let max_prio = self.tasks.iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|t| t.state == TaskState::Ready)
+            .map(|t| t.priority)
+            .max()?;
+
+        // Pass 2: pick the first Ready task with `max_prio` after the cursor
+        // (round-robin among equals).
+        for i in 0..MAX_TASKS {
+            let idx = (self.cursor + 1 + i) % MAX_TASKS;
+            if let Some(task) = &mut self.tasks[idx] {
+                if task.state == TaskState::Ready && task.priority == max_prio {
+                    task.state  = TaskState::Running;
+                    self.cursor = idx;
+                    return Some(idx);
                 }
             }
         }
@@ -48,6 +62,17 @@ impl RunQueue {
 
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Task> {
         self.tasks[idx].as_mut()
+    }
+
+    pub fn get(&self, idx: usize) -> Option<&Task> {
+        self.tasks[idx].as_ref()
+    }
+
+    /// Find the slot index of the task with the given PID.
+    pub fn find_pid(&self, pid: Pid) -> Option<usize> {
+        self.tasks.iter().position(|s| {
+            s.as_ref().map(|t| t.pid == pid).unwrap_or(false)
+        })
     }
 
     /// Block the task with `pid`, recording the port it is waiting on.
@@ -85,5 +110,13 @@ impl RunQueue {
                 }
             }
         }
+    }
+
+    /// Remove the task at `idx` from the run queue and return it so the caller
+    /// can free its resources.  Decrements the task count.
+    pub fn remove(&mut self, idx: usize) -> Option<Task> {
+        let t = self.tasks[idx].take();
+        if t.is_some() { self.len = self.len.saturating_sub(1); }
+        t
     }
 }

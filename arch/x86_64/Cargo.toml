@@ -6,4 +6,5 @@ edition.workspace = true
 [dependencies]
 cyanos-lib = { path = "../../lib" }
 mm      = { path = "../../mm" }
+sched   = { path = "../../sched" }
 bitflags.workspace = true

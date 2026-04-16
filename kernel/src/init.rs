@@ -5,17 +5,78 @@
 //! context switching and IPC before parking in a yield loop.
 
 use crate::serial_print;
+use wifi::mac80211::Mac80211;
+use wifi::cfg80211::{ScanRequest, ScanFlags};
+
+/// Probe USB xHCI controller and bring it up.
+///
+/// # Why no static MMIO address
+///
+/// QEMU `-machine virt` (AArch64) exposes USB only when the user passes
+/// `-device qemu-xhci,id=xhci` on the command line.  When present, the
+/// controller's MMIO base is assigned dynamically through ECAM (PCI
+/// configuration space) — there is no fixed physical address.  The correct
+/// way to find it is to:
+///   1. Walk the DTB `/soc/pcie@...` node to get the ECAM base.
+///   2. Enumerate PCI class 0x0C03 (USB/xHCI) devices.
+///   3. Read BAR0 of the discovered device for the MMIO base.
+///
+/// DTB enumeration is not yet implemented (tracked separately).  Until then
+/// USB probe is skipped with an informational message.
+///
+/// On x86-64 the same applies: xHCI is a PCI device discovered through ACPI
+/// or direct PCI config-space scan, not a fixed MMIO address.
+fn probe_usb() {
+    serial_print("[CYANOS] init: USB probe deferred (requires PCI/ECAM enumeration)\n");
+}
+
+/// Probe WiFi using the virtio-wifi stub and trigger an initial scan.
+///
+/// The virtio-wifi driver is a no-hardware simulation suitable for QEMU.
+/// A real driver would register with mac80211 via the `Ieee80211Ops` trait.
+fn probe_wifi() {
+    let mut mac: Mac80211<wifi::virtio_wifi::VirtioWifi> = wifi::virtio_wifi::create();
+    match mac.bring_up() {
+        Ok(()) => {
+            serial_print("[CYANOS] init: WiFi interface up\n");
+            let req = ScanRequest {
+                ssids:      [None; wifi::cfg80211::CFG80211_MAX_SCAN_SSIDS],
+                n_ssids:    0,
+                channels:   [None; wifi::cfg80211::CFG80211_MAX_SCAN_CHANNELS],
+                n_channels: 0,
+                ie:         [0u8; 256],
+                ie_len:     0,
+                flags:      ScanFlags::empty(),
+            };
+            match mac.scan(req) {
+                Ok(())  => serial_print("[CYANOS] init: WiFi scan started\n"),
+                Err(e)  => {
+                    serial_print("[CYANOS] init: WiFi scan error: ");
+                    serial_print(if e == -16 { "EBUSY\n" } else { "unknown\n" });
+                }
+            }
+        }
+        Err(e) => {
+            serial_print("[CYANOS] init: WiFi bring_up failed: ");
+            serial_print(if e == -19 { "ENODEV\n" } else { "unknown\n" });
+        }
+    }
+}
 
 /// Entry point for the init task.  Must never return (`fn() -> !`).
 pub fn init_task_main() -> ! {
     serial_print("[CYANOS] init: task started (PID 1)\n");
+
+    // ── Driver probe ──────────────────────────────────────────────────────────
+    probe_usb();
+    probe_wifi();
 
     // ── IPC smoke test ────────────────────────────────────────────────────────
     // Allocate a port, send one message to ourselves, receive it back.
     // This exercises the full send → unblock → recv path.
     match ipc::port::create(1) {
         Some(port) => {
-            ipc::port::send(port, ipc::Message::empty());
+            let _ = ipc::port::send(port, ipc::Message::empty());
 
             // recv() is non-blocking; the message was just enqueued so it is
             // immediately available.

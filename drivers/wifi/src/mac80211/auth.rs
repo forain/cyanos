@@ -1,6 +1,7 @@
 //! Authentication / Association state machine — mirrors net/mac80211/mlme.c
 
 use super::{Mac80211, Ieee80211Ops, StaConnState};
+extern crate ipc;
 use super::frame::{build_assoc_req, TxFrame};
 
 // ── Authentication (Open System) ──────────────────────────────────────────────
@@ -67,7 +68,11 @@ pub fn handle_assoc_resp<D: Ieee80211Ops>(mac: &mut Mac80211<D>, frame: &[u8]) {
     }
 
     mac.set_state(StaConnState::Associated);
-    // TODO: notify nl80211 of successful association.
+
+    // Notify the nl80211 userspace daemon via IPC.
+    // BSSID is at bytes 16..22 of the 802.11 MAC header.
+    let bssid: crate::ieee80211::MacAddr = frame[16..22].try_into().unwrap_or([0u8; 6]);
+    mac.notify_associated(&bssid, _aid);
 }
 
 // ── Private Mac80211 accessors needed by this module ─────────────────────────
@@ -77,4 +82,18 @@ impl<D: Ieee80211Ops> Mac80211<D> {
     pub(super) fn own_addr(&self) -> &crate::ieee80211::MacAddr { &self.own_addr }
     pub(super) fn set_state(&mut self, s: StaConnState) { self.state = s; }
     pub(super) fn driver_tx(&mut self, f: TxFrame) { self.driver.tx(f); }
+
+    /// Send an nl80211 IPC notification if a port is registered.
+    ///
+    /// Called from `handle_assoc_resp` on successful association.
+    /// Payload: 6-byte BSSID + 2-byte AID (LE).
+    pub(super) fn notify_associated(&self, bssid: &crate::ieee80211::MacAddr, aid: u16) {
+        if let Some(port) = self.nl80211_port {
+            let mut payload = [0u8; crate::ieee80211::ETH_ALEN + 2];
+            payload[..crate::ieee80211::ETH_ALEN].copy_from_slice(bssid);
+            payload[crate::ieee80211::ETH_ALEN..].copy_from_slice(&aid.to_le_bytes());
+            let msg = crate::nl80211::encode(crate::nl80211::Nl80211Cmd::Connect, &payload);
+            let _ = ipc::port::send(port, msg);
+        }
+    }
 }

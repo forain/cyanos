@@ -16,6 +16,7 @@ use crate::transfer::Urb;
 use ring::{Ring, RingType, Trb, TrbType};
 use context::DeviceContext;
 use regs::XhciRegs;
+use mm::buddy;
 
 // ── xHCI constants ────────────────────────────────────────────────────────────
 
@@ -29,11 +30,20 @@ pub const EP_CTX_PER_DEV:    usize = 31;
 
 // ── Slot state ────────────────────────────────────────────────────────────────
 
+/// Periodic bandwidth budget per microframe (bytes).
+/// xHCI spec §4.14.2: Full-/High-speed frames can carry at most 47 250 bytes
+/// of periodic traffic per microframe.
+const PERIODIC_BW_BUDGET: u32 = 47_250;
+
 #[allow(dead_code)]
 struct SlotData {
     device_context: DeviceContext,
     /// Transfer rings, one per endpoint (index = ep context index 1..=30).
     transfer_rings: [Option<Ring>; EP_CTX_PER_DEV + 1],
+    /// Total accumulated periodic bandwidth for this slot (bytes/µframe).
+    bandwidth_used: u32,
+    /// Per-endpoint bandwidth allocation (index = ep context index).
+    bandwidth_per_ep: [u32; EP_CTX_PER_DEV + 1],
 }
 
 // ── xHCI driver ───────────────────────────────────────────────────────────────
@@ -67,6 +77,21 @@ impl Xhci {
     /// # Safety
     /// `mmio_base` must point to a valid, mapped xHCI MMIO region.
     pub unsafe fn new(mmio_base: usize) -> Self {
+        // Allocate one 4 KiB page for the Device Context Base Address Array
+        // (DCBAA).  The DCBAA holds 256 × 8-byte pointers (one per slot plus
+        // slot 0 which is reserved / scratchpad pointer).  Must be zeroed so
+        // all unused slot pointers read as 0.
+        let dcbaa_phys: u64 = match buddy::alloc(0) {
+            Some(pa) => {
+                (pa as *mut u8).write_bytes(0, buddy::PAGE_SIZE);
+                pa as u64
+            }
+            // If the allocator is not yet initialised (very early probe), leave
+            // the pointer at 0; start() will BUG because init_rings() writes
+            // it to DCBAAP and the HC will fault on any slot operation.
+            None => 0,
+        };
+
         Self {
             mmio_base,
             regs: XhciRegs::new(mmio_base),
@@ -74,7 +99,7 @@ impl Xhci {
             cmd_ring:   Ring::new(RingType::Command),
             event_ring: Ring::new(RingType::Event),
             slots: core::array::from_fn(|_| None),
-            dcbaa_phys: 0,
+            dcbaa_phys,
             cmd_ccs: true,
         }
     }
@@ -128,13 +153,88 @@ impl Xhci {
     }
 
     /// Issue ENABLE_SLOT and return the allocated slot ID.
+    ///
+    /// Polls the event ring until a `CmdCompletion` event arrives, then
+    /// extracts the slot ID from `control[31:24]` and updates ERDP.
     #[allow(dead_code)]
     unsafe fn enable_slot(&mut self) -> Result<u8, HcdError> {
         let trb = Trb::command(TrbType::EnableSlot, 0, 0, 0);
         self.send_command(trb);
-        // In real driver: wait for Command Completion Event on event ring.
-        // Here we return a placeholder — real impl polls event_ring.
-        Ok(1) // TODO: poll event ring for slot ID
+
+        // Poll event ring for the Command Completion event.
+        let mut spins: usize = 0;
+        loop {
+            if let Some(evt) = self.event_ring.dequeue_event() {
+                if evt.trb_type() == TrbType::CmdCompletion as u8 {
+                    // Slot ID is in control bits [31:24].
+                    let slot_id = (evt.control >> 24) as u8;
+                    // Update ERDP so the HC knows we consumed the event.
+                    let dp = self.event_ring.deq_phys();
+                    self.regs.ir_write64(0, regs::IR_ERDP, dp | regs::ERDP_EHB);
+                    if slot_id == 0 {
+                        return Err(HcdError::HardwareError);
+                    }
+                    return Ok(slot_id);
+                }
+            }
+            spins += 1;
+            if spins > 1_000_000 { return Err(HcdError::Timeout); }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Issue a Control-IN transfer on EP0 of `slot`.
+    ///
+    /// Sends the 8-byte SETUP packet, reads `buf.len()` bytes into `buf` (DATA
+    /// stage), then sends the OUT STATUS packet.  Returns `true` on success.
+    ///
+    /// # Safety
+    /// Caller must ensure `slot` is valid and has an EP0 transfer ring.
+    unsafe fn ep0_control_in(
+        &mut self,
+        slot: usize,
+        setup: [u8; 8],
+        buf:   &mut [u8],
+    ) -> bool {
+        let buf_phys = buf.as_ptr() as u64;
+        let buf_len  = buf.len() as u32;
+
+        let ring = match self.slots[slot]
+            .as_mut()
+            .and_then(|s| s.transfer_rings[1].as_mut())
+        {
+            Some(r) => r,
+            None    => return false,
+        };
+
+        ring.enqueue(Trb::setup(setup, 3, false));  // TT=3: IN data stage
+        ring.enqueue(Trb::data(buf_phys, buf_len, true, false));
+        ring.enqueue(Trb::status(true, false));     // STATUS OUT
+
+        let db_addr = self.mmio_base
+            + self.regs.db_offset() as usize
+            + slot * 4;
+        (db_addr as *mut u32).write_volatile(1); // EP0 doorbell
+        self.wait_transfer_event().is_ok()
+    }
+
+    /// Poll the event ring for a `TransferEvent` and update ERDP.
+    unsafe fn wait_transfer_event(&mut self) -> Result<u32, HcdError> {
+        let mut spins: usize = 0;
+        loop {
+            if let Some(evt) = self.event_ring.dequeue_event() {
+                if evt.trb_type() == TrbType::TransferEvent as u8 {
+                    let dp = self.event_ring.deq_phys();
+                    self.regs.ir_write64(0, regs::IR_ERDP, dp | regs::ERDP_EHB);
+                    // Completion code is in status[31:24]; 1 = success.
+                    let cc = (evt.status >> 24) & 0xFF;
+                    return if cc == 1 { Ok(evt.status & 0x00FF_FFFF) } else { Err(HcdError::HardwareError) };
+                }
+            }
+            spins += 1;
+            if spins > 2_000_000 { return Err(HcdError::Timeout); }
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -164,33 +264,461 @@ impl HostControllerDriver for Xhci {
 
     fn state(&self) -> HcdState { self.state }
 
-    fn submit_urb(&mut self, _urb: Urb) -> Result<(), HcdError> {
-        // TODO: map URB to one or more Transfer TRBs, enqueue to the device's
-        // transfer ring for the target endpoint, ring the endpoint doorbell.
+    fn submit_urb(&mut self, urb: Urb) -> Result<(), HcdError> {
+        // Derive endpoint context index from the pipe.
+        //   EP0:     ctx 1 (bidirectional control)
+        //   EPn OUT: ctx 2n
+        //   EPn IN:  ctx 2n+1
+        let ep_num  = (urb.pipe & 0x0F) as usize;
+        let dir_in  = urb.transfer_flags.contains(crate::transfer::TransferFlags::DIR_IN);
+        let ep_ctx  = if ep_num == 0 { 1 } else { ep_num * 2 + (dir_in as usize) };
+
+        // Use device address as slot index (simplified: assumes 1:1 mapping).
+        let slot = urb.dev_address as usize;
+        if slot == 0 || slot >= XHCI_MAX_SLOTS {
+            return Err(HcdError::Invalid);
+        }
+
+        let ring = self.slots[slot]
+            .as_mut()
+            .and_then(|s| s.transfer_rings[ep_ctx].as_mut())
+            .ok_or(HcdError::Invalid)?;
+
+        ring.enqueue(Trb::normal(
+            urb.transfer_buffer_phys,
+            urb.transfer_buffer_length,
+            true,  // IOC — interrupt on completion
+            false, // not chained
+            false, // cycle: enqueue() overrides this
+        ));
+
+        // Ring the endpoint doorbell: register at db_base + slot*4, value = ep_ctx_idx.
+        unsafe {
+            let db_addr = self.mmio_base
+                + self.regs.db_offset() as usize
+                + slot * 4;
+            (db_addr as *mut u32).write_volatile(ep_ctx as u32);
+        }
+
         Ok(())
     }
 
-    fn kill_urb(&mut self, _urb_context: u64) {
-        // TODO: issue STOP_ENDPOINT command, dequeue the matching TRB.
+    fn kill_urb(&mut self, urb_context: u64) {
+        // urb_context encoding (set by the submit side):
+        //   bits [31:8]  = slot ID
+        //   bits  [7:0]  = endpoint context index (1–30)
+        let slot   = ((urb_context >> 8) & 0xFFFFFF) as usize;
+        let ep_ctx = (urb_context & 0xFF) as u32;
+
+        if slot == 0 || slot >= XHCI_MAX_SLOTS || ep_ctx == 0 { return; }
+
+        // STOP_ENDPOINT command (xHCI spec §6.4.3.5):
+        //   control[31:24] = slot ID
+        //   control[20:16] = endpoint context index
+        //   control[23]    = Suspend (TSP) — 0 here
+        let ctrl_flags = ((slot as u32) << 24) | (ep_ctx << 16);
+        unsafe {
+            let trb = Trb::command(TrbType::StopRing, 0, 0, ctrl_flags);
+            self.send_command(trb);
+
+            // Poll for the CmdCompletion event and update ERDP.
+            let mut spins: usize = 0;
+            loop {
+                if let Some(evt) = self.event_ring.dequeue_event() {
+                    if evt.trb_type() == TrbType::CmdCompletion as u8 {
+                        let dp = self.event_ring.deq_phys();
+                        self.regs.ir_write64(0, regs::IR_ERDP, dp | regs::ERDP_EHB);
+                        break;
+                    }
+                }
+                spins += 1;
+                if spins > 1_000_000 { break; }
+                core::hint::spin_loop();
+            }
+        }
     }
 
-    fn get_device_descriptor(&mut self, _dev: &UsbDevice) -> Option<DeviceDescriptor> {
-        // TODO: build a SETUP+DATA+STATUS URB, submit synchronously.
-        None
+    fn get_device_descriptor(&mut self, dev: &UsbDevice) -> Option<DeviceDescriptor> {
+        // Build a synchronous control transfer to fetch the 18-byte device descriptor.
+        //
+        // USB GET_DESCRIPTOR request (device descriptor):
+        //   bmRequestType=0x80, bRequest=0x06, wValue=0x0100, wIndex=0, wLength=18
+        let setup: [u8; 8] = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00];
+
+        // EP0 (bidirectional control) uses context index 1.
+        let slot = dev.devnum as usize;
+        if slot == 0 || slot >= XHCI_MAX_SLOTS { return None; }
+
+        // Allocate a 4 KiB DMA page for the descriptor buffer.  buddy::alloc
+        // returns a physical address, which equals the virtual address in the
+        // kernel's identity-mapped region.  Using a dedicated DMA page avoids
+        // the stack-buffer-as-DMA-target anti-pattern: once the MMU is enabled
+        // with non-identity page tables, stack VA ≠ PA and the HC would DMA
+        // into the wrong memory.
+        let dma_phys = buddy::alloc(0)?;
+        unsafe { (dma_phys as *mut u8).write_bytes(0, 18); }
+
+        let ring = match self.slots[slot]
+            .as_mut()
+            .and_then(|s| s.transfer_rings[1].as_mut())
+        {
+            Some(r) => r,
+            None    => { buddy::free(dma_phys, 0); return None; }
+        };
+
+        // SETUP stage (transfer type 3 = control IN).
+        ring.enqueue(Trb::setup(setup, 3, false));
+        // DATA stage (IN, 18 bytes into DMA page).
+        ring.enqueue(Trb::data(dma_phys as u64, 18, true, false));
+        // STATUS stage (OUT).
+        ring.enqueue(Trb::status(true, false));
+        // ring borrow ends here (NLL — no further use).
+
+        // Ring EP0 doorbell.
+        unsafe {
+            let db_addr = self.mmio_base
+                + self.regs.db_offset() as usize
+                + slot * 4;
+            (db_addr as *mut u32).write_volatile(1); // EP0 ctx = 1
+        }
+
+        // Wait for the transfer event (polls the event ring).
+        let ok = unsafe { self.wait_transfer_event().is_ok() };
+
+        // Read the descriptor out of the DMA page before freeing it.
+        let result = if ok {
+            let buf = unsafe { core::slice::from_raw_parts(dma_phys as *const u8, 18) };
+            if buf[0] >= 18 && buf[1] == crate::descriptor::DT_DEVICE {
+                Some(DeviceDescriptor {
+                    b_length:             buf[0],
+                    b_descriptor_type:    buf[1],
+                    bcd_usb:              crate::descriptor::Le16(u16::from_le_bytes([buf[2], buf[3]])),
+                    b_device_class:       buf[4],
+                    b_device_sub_class:   buf[5],
+                    b_device_protocol:    buf[6],
+                    b_max_packet_size0:   buf[7],
+                    id_vendor:            crate::descriptor::Le16(u16::from_le_bytes([buf[8], buf[9]])),
+                    id_product:           crate::descriptor::Le16(u16::from_le_bytes([buf[10], buf[11]])),
+                    bcd_device:           crate::descriptor::Le16(u16::from_le_bytes([buf[12], buf[13]])),
+                    i_manufacturer:       buf[14],
+                    i_product:            buf[15],
+                    i_serial_number:      buf[16],
+                    b_num_configurations: buf[17],
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        buddy::free(dma_phys, 0);
+        result
     }
 
-    fn get_config_descriptor(&mut self, _dev: &UsbDevice, _cfg_idx: u8)
+    fn get_config_descriptor(&mut self, dev: &UsbDevice, cfg_idx: u8)
         -> Option<ConfigDescriptor>
     {
-        None // TODO
+        // GET_DESCRIPTOR(config): bmRequestType=0x80, bRequest=0x06,
+        // wValue = (DT_CONFIG<<8)|cfg_idx, wIndex=0, wLength=9
+        let setup: [u8; 8] = [
+            0x80, 0x06, cfg_idx, crate::descriptor::DT_CONFIG,
+            0x00, 0x00, 9, 0x00,
+        ];
+
+        let slot = dev.devnum as usize;
+        if slot == 0 || slot >= XHCI_MAX_SLOTS { return None; }
+
+        // Allocate a 4 KiB DMA page for the descriptor buffer (physical ==
+        // virtual in the kernel identity map; avoids stack-VA-as-DMA anti-pattern).
+        let dma_phys = buddy::alloc(0)?;
+        unsafe { (dma_phys as *mut u8).write_bytes(0, 9); }
+
+        let ring = match self.slots[slot]
+            .as_mut()
+            .and_then(|s| s.transfer_rings[1].as_mut())
+        {
+            Some(r) => r,
+            None    => { buddy::free(dma_phys, 0); return None; }
+        };
+
+        // Control IN transfer: SETUP → DATA (IN) → STATUS (OUT).
+        ring.enqueue(Trb::setup(setup, 3, false));
+        ring.enqueue(Trb::data(dma_phys as u64, 9, true, false));
+        ring.enqueue(Trb::status(true, false));
+        // ring borrow ends here (NLL).
+
+        unsafe {
+            let db_addr = self.mmio_base
+                + self.regs.db_offset() as usize
+                + slot * 4;
+            (db_addr as *mut u32).write_volatile(1); // EP0 ctx = 1
+        }
+
+        let ok = unsafe { self.wait_transfer_event().is_ok() };
+
+        let result = if ok {
+            let buf = unsafe { core::slice::from_raw_parts(dma_phys as *const u8, 9) };
+            if buf[0] >= 9 && buf[1] == crate::descriptor::DT_CONFIG {
+                Some(ConfigDescriptor {
+                    b_length:              buf[0],
+                    b_descriptor_type:     buf[1],
+                    w_total_length:        crate::descriptor::Le16(u16::from_le_bytes([buf[2], buf[3]])),
+                    b_num_interfaces:      buf[4],
+                    b_configuration_value: buf[5],
+                    i_configuration:       buf[6],
+                    bm_attributes:         buf[7],
+                    b_max_power:           buf[8],
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        buddy::free(dma_phys, 0);
+        result
     }
 
-    fn set_address(&mut self, _dev: &mut UsbDevice, _address: u8) {
-        // TODO: issue ADDRESS_DEVICE command TRB.
+    fn set_address(&mut self, dev: &mut UsbDevice, _address: u8) {
+        unsafe {
+            // ── 1. Allocate an xHCI slot ──────────────────────────────────────
+            let slot_id = match self.enable_slot() {
+                Ok(id) => id,
+                Err(_) => return,
+            };
+
+            // Use slot_id as devnum so all subsequent lookups (submit_urb,
+            // get_device_descriptor, etc.) resolve to the right slot entry.
+            dev.devnum = slot_id;
+
+            // ── 2. Initialise slot data with an EP0 transfer ring ─────────────
+            self.slots[slot_id as usize] = Some(SlotData {
+                device_context: context::DeviceContext::default(),
+                transfer_rings: core::array::from_fn(|i| {
+                    if i == 1 { Some(Ring::new(RingType::Transfer)) } else { None }
+                }),
+                bandwidth_used:    0,
+                bandwidth_per_ep:  [0u32; EP_CTX_PER_DEV + 1],
+            });
+
+            // ── 3. Build a proper InputContext ────────────────────────────────
+            // Must be populated before ADDRESS_DEVICE so the HC can read slot
+            // speed, root-hub port, and the EP0 transfer-ring dequeue pointer.
+            let ep0_ring_phys = self.slots[slot_id as usize]
+                .as_ref().unwrap()
+                .transfer_rings[1].as_ref().unwrap()
+                .phys_base();
+
+            let mut ic = context::InputContext::default();
+            // add_flags: bit 0 = slot context, bit 1 = EP0 (context index 1).
+            ic.ctrl.add_flags = 0b11;
+
+            // Slot context: High-speed device on root-hub port 1, EP0 only.
+            ic.device.slot.dev_info  = context::SlotContext::build_dev_info(
+                0,                          // route string (root hub = 0)
+                context::SLOT_SPEED_HS,     // assume High-Speed (480 Mb/s)
+                false,                      // not a hub
+                1,                          // last_ctx = 1 (EP0 only)
+            );
+            // dev_info2 bits[23:16] = root-hub port number (1-based).
+            ic.device.slot.dev_info2 = 1 << 16;
+
+            // EP0 context: bidirectional control, cerr=3, max-packet=64.
+            ic.device.ep[0].ep_info2 = context::EndpointContext::build_ep_info2(
+                context::EP_TYPE_CTRL, // 4
+                3,                     // CErr: 3 retries
+                0,                     // max burst = 0
+                64,                    // bMaxPacketSize0 for HS EP0
+            );
+            // Dequeue pointer: ring base, DCS=1 (matches initial PCS=1).
+            ic.device.ep[0].deq_lo  = ep0_ring_phys as u32 | 1;
+            ic.device.ep[0].deq_hi  = (ep0_ring_phys >> 32) as u32;
+            // Average TRB length = 8 (SETUP packet size).
+            ic.device.ep[0].tx_info = 8;
+
+            // ── 4. Issue ADDRESS_DEVICE command ───────────────────────────────
+            // Hardware reads InputContext via DMA; we poll for completion before
+            // returning so the stack-allocated ic stays valid throughout.
+            let ic_phys = core::ptr::addr_of!(ic) as u64;
+            let trb = Trb::command(
+                TrbType::AddressDevice,
+                ic_phys as u32,
+                (ic_phys >> 32) as u32,
+                (slot_id as u32) << 24,
+            );
+            self.send_command(trb);
+
+            // Poll for CmdCompletion so we know the HC has finished reading ic.
+            let mut spins: usize = 0;
+            loop {
+                if let Some(evt) = self.event_ring.dequeue_event() {
+                    if evt.trb_type() == TrbType::CmdCompletion as u8 {
+                        let dp = self.event_ring.deq_phys();
+                        self.regs.ir_write64(0, regs::IR_ERDP, dp | regs::ERDP_EHB);
+                        break;
+                    }
+                }
+                spins += 1;
+                if spins > 1_000_000 { break; }
+                core::hint::spin_loop();
+            }
+        }
     }
 
-    fn set_configuration(&mut self, _dev: &mut UsbDevice, _config_value: u8) {
-        // TODO: issue CONFIGURE_ENDPOINT command TRB.
+    fn set_configuration(&mut self, dev: &mut UsbDevice, config_value: u8) {
+        let slot = dev.devnum as usize;
+        if slot == 0 || slot >= XHCI_MAX_SLOTS { return; }
+
+        // ── 1. Fetch full configuration descriptor ────────────────────────────
+        // First 9 bytes to read wTotalLength.
+        let mut hdr = [0u8; 9];
+        let ok = unsafe {
+            self.ep0_control_in(slot,
+                [0x80, 0x06, 0, crate::descriptor::DT_CONFIG, 0, 0, 9, 0],
+                &mut hdr)
+        };
+        if !ok || hdr[1] != crate::descriptor::DT_CONFIG { return; }
+        let total = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+        let fetch  = total.min(512);
+
+        // Fetch the full blob (cap at 512 bytes).
+        let mut blob = [0u8; 512];
+        let ok2 = unsafe {
+            self.ep0_control_in(slot,
+                [0x80, 0x06, 0, crate::descriptor::DT_CONFIG, 0, 0,
+                 (fetch & 0xFF) as u8, (fetch >> 8) as u8],
+                &mut blob[..fetch])
+        };
+        if !ok2 { return; }
+
+        // ── 2. Walk descriptors; allocate a transfer ring per new endpoint ─────
+        // Collect (ep_ctx_idx, xhci_type, mps, interval) for each endpoint found.
+        // We need up to EP_CTX_PER_DEV = 30 data endpoints (not counting EP0).
+        let mut ep_table = [(0usize, 0u8, 0u16, 0u8); 30];
+        let mut n_eps     = 0usize;
+        let mut last_ctx  = 1u8; // highest ep context index seen
+
+        let mut off = 0usize;
+        while off + 2 <= fetch {
+            let blen = blob[off] as usize;
+            let btyp = blob[off + 1];
+            if blen < 2 || off + blen > fetch { break; }
+
+            if btyp == crate::descriptor::DT_ENDPOINT && blen >= 7 {
+                let ep_addr  = blob[off + 2];
+                let bm_attr  = blob[off + 3];
+                let mps      = u16::from_le_bytes([blob[off + 4], blob[off + 5]]) & 0x07FF;
+                let interval = blob[off + 6];
+
+                let ep_num   = (ep_addr & 0x0F) as usize;
+                let dir_in   = ep_addr & 0x80 != 0;
+                let xfer_typ = bm_attr & 0x03;
+
+                // xHCI EP type code.
+                let xhci_typ = match (xfer_typ, dir_in) {
+                    (0, _)     => context::EP_TYPE_CTRL,
+                    (1, false) => context::EP_TYPE_ISOCH_OUT,
+                    (1, true)  => context::EP_TYPE_ISOCH_IN,
+                    (2, false) => context::EP_TYPE_BULK_OUT,
+                    (2, true)  => context::EP_TYPE_BULK_IN,
+                    (3, false) => context::EP_TYPE_INTR_OUT,
+                    (3, true)  => context::EP_TYPE_INTR_IN,
+                    _          => { off += blen; continue; }
+                };
+
+                // xHCI context index: EP n OUT = 2n, EP n IN = 2n+1.
+                let ctx_idx = if ep_num == 0 { 1 } else { ep_num * 2 + dir_in as usize };
+                if ctx_idx > EP_CTX_PER_DEV { off += blen; continue; }
+
+                // Allocate a transfer ring for this endpoint.
+                if let Some(sd) = self.slots[slot].as_mut() {
+                    if sd.transfer_rings[ctx_idx].is_none() {
+                        sd.transfer_rings[ctx_idx] = Some(Ring::new(RingType::Transfer));
+                    }
+                }
+
+                if n_eps < 30 {
+                    ep_table[n_eps] = (ctx_idx, xhci_typ, mps, interval);
+                    n_eps += 1;
+                }
+                if ctx_idx as u8 > last_ctx { last_ctx = ctx_idx as u8; }
+            }
+            off += blen;
+        }
+
+        // ── 3. USB SET_CONFIGURATION control transfer ─────────────────────────
+        unsafe {
+            let ring = match self.slots[slot]
+                .as_mut()
+                .and_then(|s| s.transfer_rings[1].as_mut())
+            { Some(r) => r, None => return };
+
+            let setup: [u8; 8] = [0x00, 0x09, config_value, 0x00, 0x00, 0x00, 0x00, 0x00];
+            ring.enqueue(Trb::setup(setup, 0, false)); // TT=0: no data
+            ring.enqueue(Trb::status(false, false));   // STATUS IN
+
+            let db_addr = self.mmio_base + self.regs.db_offset() as usize + slot * 4;
+            (db_addr as *mut u32).write_volatile(1);
+            let _ = self.wait_transfer_event();
+        }
+
+        // ── 4. Build InputContext and issue CONFIGURE_ENDPOINT ────────────────
+        let mut ic = context::InputContext::default();
+
+        // Bit 0 = slot context; one bit per ep context index (1-based → bit n).
+        let mut add_flags: u32 = 0b01;
+
+        for i in 0..n_eps {
+            let (ctx_idx, xhci_typ, mps, interval) = ep_table[i];
+
+            let ring_phys = self.slots[slot]
+                .as_ref()
+                .and_then(|sd| sd.transfer_rings[ctx_idx].as_ref())
+                .map(|r| r.phys_base())
+                .unwrap_or(0);
+
+            let ep = &mut ic.device.ep[ctx_idx - 1];
+            ep.ep_info  = (interval as u32) << 16;   // bits[23:16] = Interval
+            ep.ep_info2 = context::EndpointContext::build_ep_info2(xhci_typ, 3, 0, mps);
+            ep.deq_lo   = ring_phys as u32 | 1;      // DCS = 1
+            ep.deq_hi   = (ring_phys >> 32) as u32;
+            ep.tx_info  = mps as u32;                 // average TRB length ≈ MPS
+
+            add_flags |= 1 << ctx_idx;
+        }
+
+        ic.ctrl.add_flags  = add_flags;
+        ic.device.slot.dev_info = context::SlotContext::build_dev_info(
+            0, context::SLOT_SPEED_HS, false, last_ctx,
+        );
+
+        let ic_phys = core::ptr::addr_of!(ic) as u64;
+
+        unsafe {
+            let trb = Trb::command(
+                TrbType::ConfigureEp,
+                ic_phys as u32,
+                (ic_phys >> 32) as u32,
+                (slot as u32) << 24,
+            );
+            self.send_command(trb);
+
+            let mut spins: usize = 0;
+            loop {
+                if let Some(evt) = self.event_ring.dequeue_event() {
+                    if evt.trb_type() == TrbType::CmdCompletion as u8 {
+                        let dp = self.event_ring.deq_phys();
+                        self.regs.ir_write64(0, regs::IR_ERDP, dp | regs::ERDP_EHB);
+                        break;
+                    }
+                }
+                spins += 1;
+                if spins > 1_000_000 { break; }
+                core::hint::spin_loop();
+            }
+        }
     }
 
     fn get_port_status(&mut self, port: u8) -> Option<(u16, u16)> {
@@ -214,16 +742,124 @@ impl HostControllerDriver for Xhci {
         }
     }
 
-    fn set_port_feature(&mut self, _port: u8, _feature: u16) { /* TODO */ }
-    fn clear_port_feature(&mut self, _port: u8, _feature: u16) { /* TODO */ }
+    fn set_port_feature(&mut self, port: u8, feature: u16) {
+        // USB hub port feature selectors (ch11, Table 11-17).
+        // We map to xHCI PORTSC bits; writing any RW1C change bit is a no-op for
+        // SetPortFeature — only ClearPortFeature uses RW1C writes.
+        use regs::*;
 
-    fn alloc_bandwidth(&mut self, _dev: &UsbDevice, _ep: u8, bpf: u32)
-        -> Result<u32, HcdError>
-    {
-        Ok(bpf) // TODO: real bandwidth accounting
+        // Port link state for Suspend (PLS = 3 = U3).
+        const PLS_SUSPEND: u32 = 3 << 5;
+
+        let portsc_bit: Option<u32> = match feature {
+            1  => Some(PORTSC_PED),  // PORT_FEAT_ENABLE  → enable bit (write 1 re-enables)
+            4  => Some(PORTSC_PR),   // PORT_FEAT_RESET   → initiate port reset
+            8  => Some(PORTSC_PP),   // PORT_FEAT_POWER   → turn port power on
+            22 => Some(PORTSC_PIC),  // PORT_FEAT_INDICATOR → port indicator on
+            _  => None,
+        };
+
+        // Suspend is set via PLS field, not a single-bit toggle.
+        let is_suspend = feature == 2;
+
+        if portsc_bit.is_none() && !is_suspend { return; }
+
+        unsafe {
+            let offset = OP_PORTSC + (port as usize - 1) * 0x10;
+            let portsc = self.regs.op_read32(offset);
+            let rw = portsc & PORTSC_RW_MASK;
+
+            let new_portsc = if is_suspend {
+                (rw & !PORTSC_PLS) | PLS_SUSPEND | PORTSC_LWS
+            } else {
+                rw | portsc_bit.unwrap()
+            };
+            self.regs.op_write32(offset, new_portsc);
+        }
     }
 
-    fn free_bandwidth(&mut self, _dev: &UsbDevice, _ep: u8) {}
+    fn clear_port_feature(&mut self, port: u8, feature: u16) {
+        use regs::*;
+
+        // RW1C change bits — write 1 to clear the status-change flag.
+        let rw1c_bit: Option<u32> = match feature {
+            16 => Some(PORTSC_CSC), // PORT_FEAT_C_CONNECTION
+            17 => Some(PORTSC_PEC), // PORT_FEAT_C_ENABLE
+            18 => Some(PORTSC_PLC), // PORT_FEAT_C_SUSPEND (link-state change)
+            19 => Some(PORTSC_OCC), // PORT_FEAT_C_OVER_CURRENT
+            20 => Some(PORTSC_PRC), // PORT_FEAT_C_RESET
+            _  => None,
+        };
+
+        // Regular read-write bits to clear.
+        let rw_clear_bit: Option<u32> = match feature {
+            1  => Some(PORTSC_PED), // PORT_FEAT_ENABLE → disable port
+            8  => Some(PORTSC_PP),  // PORT_FEAT_POWER  → turn port power off
+            22 => Some(PORTSC_PIC), // PORT_FEAT_INDICATOR → indicator off
+            _  => None,
+        };
+
+        // Suspend (feature 2): clear via PLS = U0.
+        let is_unsuspend = feature == 2;
+
+        if rw1c_bit.is_none() && rw_clear_bit.is_none() && !is_unsuspend { return; }
+
+        unsafe {
+            let offset = OP_PORTSC + (port as usize - 1) * 0x10;
+            let portsc  = self.regs.op_read32(offset);
+            let rw      = portsc & PORTSC_RW_MASK;
+
+            let new_portsc = if let Some(bit) = rw1c_bit {
+                // Write 1 to the RW1C bit; preserve RW fields; don't touch other RW1C.
+                rw | bit
+            } else if let Some(bit) = rw_clear_bit {
+                rw & !bit
+            } else {
+                // Unsuspend: drive PLS to U0 with LWS strobe.
+                (rw & !PORTSC_PLS) | PORTSC_LWS // PLS = 0 = U0
+            };
+            self.regs.op_write32(offset, new_portsc);
+        }
+    }
+
+    fn alloc_bandwidth(&mut self, dev: &UsbDevice, ep_address: u8, bpf: u32)
+        -> Result<u32, HcdError>
+    {
+        let slot    = dev.devnum as usize;
+        if slot == 0 || slot >= XHCI_MAX_SLOTS { return Err(HcdError::Invalid); }
+
+        // Derive context index from endpoint address (same mapping as submit_urb).
+        let ep_num   = (ep_address & 0x0F) as usize;
+        let dir_in   = ep_address & 0x80 != 0;
+        let ep_ctx   = if ep_num == 0 { 1 } else { ep_num * 2 + dir_in as usize };
+        if ep_ctx > EP_CTX_PER_DEV { return Err(HcdError::Invalid); }
+
+        let sd = self.slots[slot].as_mut().ok_or(HcdError::Invalid)?;
+
+        // Reject if adding would breach the periodic budget.
+        let new_total = sd.bandwidth_used.saturating_add(bpf);
+        if new_total > PERIODIC_BW_BUDGET { return Err(HcdError::Invalid); }
+
+        sd.bandwidth_per_ep[ep_ctx]  = bpf;
+        sd.bandwidth_used            = new_total;
+        Ok(bpf)
+    }
+
+    fn free_bandwidth(&mut self, dev: &UsbDevice, ep_address: u8) {
+        let slot = dev.devnum as usize;
+        if slot == 0 || slot >= XHCI_MAX_SLOTS { return; }
+
+        let ep_num = (ep_address & 0x0F) as usize;
+        let dir_in = ep_address & 0x80 != 0;
+        let ep_ctx = if ep_num == 0 { 1 } else { ep_num * 2 + dir_in as usize };
+        if ep_ctx > EP_CTX_PER_DEV { return; }
+
+        if let Some(sd) = self.slots[slot].as_mut() {
+            let freed = sd.bandwidth_per_ep[ep_ctx];
+            sd.bandwidth_used        = sd.bandwidth_used.saturating_sub(freed);
+            sd.bandwidth_per_ep[ep_ctx] = 0;
+        }
+    }
 }
 
 // ── PORTSC translation helpers ────────────────────────────────────────────────

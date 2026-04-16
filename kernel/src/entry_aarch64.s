@@ -1,13 +1,25 @@
 // AArch64 bare-metal entry point — kernel/src/entry_aarch64.s
 //
-// QEMU -machine virt boots an ELF by jumping to its entry point at EL1.
-// On entry:
-//   x0  = physical address of device-tree blob (DTB)  [Linux kernel ABI]
-//   x1-x3 = 0 (reserved by Linux ABI; QEMU sets them 0)
+// Supports two boot environments:
+//   QEMU -machine virt : enters at EL1 directly.
+//   Raspberry Pi 5     : firmware (VideoCore / TF-A) enters at EL2.
+//
+// On entry (Linux kernel ABI):
+//   x0  = physical address of device-tree blob (DTB), or 0
+//   x1-x3 = 0 (reserved)
 //   SP  = undefined (we set it here)
 //   MMU = off, caches = off, interrupts = off
 //
-// Ref: Linux arch/arm64/kernel/head.S, §4.1 AArch64 booting
+// Boot sequence:
+//   1. Park secondary CPUs.
+//   2. Detect current EL; if EL2, configure HCR_EL2 and ERET to EL1h.
+//   3. Set up stack (SP_EL1 after the drop).
+//   4. Zero BSS.
+//   5. Clear unwanted SCTLR_EL1 bits (MMU/cache off).
+//   6. Install VBAR_EL1.
+//   7. Call kernel_main(dtb_ptr).
+//
+// Ref: Linux arch/arm64/kernel/head.S; ARM DDI 0487 §D1.10
 
 .section ".text.boot", "ax", @progbits
 .global _start
@@ -17,8 +29,41 @@ _start:
     and     x1, x1, #0xFF           // Aff0 field
     cbnz    x1, .Lcpu_park
 
-    // ── Set up initial stack ──────────────────────────────────────────────────
-    // __stack_top is defined by the linker script (top of a 64 KB block in BSS)
+    // ── Drop from EL2 → EL1h if required (RPi 5 / TF-A boots at EL2) ────────
+    //
+    // CurrentEL[3:2] encodes the current EL:
+    //   0b0100 = EL1,  0b1000 = EL2,  0b1100 = EL3
+    //
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2
+    and     x1, x1, #0x3
+    cmp     x1, #2
+    bne     .Lel1_entry             // already at EL1 (QEMU)
+
+    // Running at EL2.  Minimally configure HCR_EL2 and drop to EL1h.
+
+    // HCR_EL2.RW = 1 (bit 31): EL1 executes as AArch64.
+    // All other bits 0: no virtualisation, no TGE, no routing.
+    mov     x1, #(1 << 31)
+    msr     hcr_el2, x1
+
+    // SPSR_EL2 for return to EL1h with all exceptions (D/A/I/F) masked:
+    //   M[3:0] = 0b0101  → EL1h (dedicated SP_EL1)
+    //   DAIF   = 0b1111  → bits [9:6] all set → 0x3C0
+    //   Combined: 0x3C5
+    mov     x1, #0x3C5
+    msr     spsr_el2, x1
+
+    // ELR_EL2 = address to return to after ERET.
+    adr     x1, .Lel1_entry
+    msr     elr_el2, x1
+    isb
+
+    eret                            // drops to EL1h, resumes at .Lel1_entry
+
+.Lel1_entry:
+    // ── Set up initial stack (SP_EL1) ─────────────────────────────────────────
+    // __stack_top is defined by the linker script (top of a 64 KiB block).
     adrp    x1, __stack_top
     add     x1, x1, :lo12:__stack_top
     mov     sp, x1
@@ -39,9 +84,8 @@ _start:
     b.lo    .Lbss_loop
 
     // ── Minimal EL1 system register setup ────────────────────────────────────
-    // SCTLR_EL1: disable MMU (M), data cache (C), instruction cache (I).
-    // We keep strict alignment off (A=0) so the Rust runtime isn't tripped up
-    // before mm::init() aligns everything properly.
+    // Clear SCTLR_EL1: disable MMU (M), data cache (C), instruction cache (I).
+    // Leave strict alignment off (A=0) so Rust does not fault before mm::init().
     mrs     x1, sctlr_el1
     mov     x2, #(1 << 0)          // M: MMU enable
     orr     x2, x2, #(1 << 2)      // C: D-cache enable
@@ -50,8 +94,13 @@ _start:
     msr     sctlr_el1, x1
     isb
 
-    // ── Set VBAR_EL1 to our exception vector table ────────────────────────────
+    // ── Install exception vector table ────────────────────────────────────────
+    // IMPORTANT: adrp alone gives the 4-KiB page BASE containing the label,
+    // not the label itself.  __exception_vectors is 2-KiB aligned (not 4-KiB),
+    // so it may sit 0x800 bytes into a page.  Must add the page offset with
+    // the :lo12: relocation to get the exact address for VBAR_EL1.
     adrp    x1, __exception_vectors
+    add     x1, x1, :lo12:__exception_vectors
     msr     vbar_el1, x1
     isb
 
@@ -59,7 +108,7 @@ _start:
     mov     x0, x19                 // restore DTB pointer as first argument
     bl      kernel_main
 
-    // ── kernel_main returned (should never happen — it's -> !) ───────────────
+    // ── kernel_main returned (should never happen — it returns !) ────────────
     b       .Lcpu_park
 
 .Lcpu_park:

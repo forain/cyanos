@@ -1,49 +1,45 @@
 # Cyanos build configuration
 #
-# Default target: AArch64 bare metal (matches the development device).
-# For x86-64:  cargo build --target x86_64-unknown-none
+# rust-toolchain.toml pins the nightly toolchain and pre-fetches both targets,
+# so no manual rustup commands are needed.
 #
-# Building requires nightly Rust + rust-src component:
-#   rustup toolchain install nightly
-#   rustup component add rust-src --toolchain nightly
-#   cargo +nightly build -Z build-std=core,compiler_builtins \
-#         -Z build-std-features=compiler-builtins-mem
+# Common commands:
+#   cargo build --target aarch64-unknown-none          # AArch64 / QEMU
+#   cargo build --target aarch64-unknown-none \
+#               --features rpi5                        # AArch64 / Raspberry Pi 5
+#   cargo build --target x86_64-unknown-none           # x86-64 / UEFI PC
+#   cargo run   --target x86_64-unknown-none           # x86-64 in QEMU (Limine+OVMF)
 #
-# For `cargo check` during development (stable Rust, type-checks only):
+# For fast type-checking on the host (no bare-metal toolchain needed):
 #   cargo check --target aarch64-linux-android
 
 [build]
 target = "aarch64-unknown-none"
 
-# ── QEMU test runners ─────────────────────────────────────────────────────────
-# `cargo run` will launch QEMU with the built kernel ELF.
-
+# ── AArch64 — QEMU virt, direct ELF load ─────────────────────────────────────
 [target.aarch64-unknown-none]
 runner = [
     "qemu-system-aarch64",
     "-machine", "virt",
-    "-cpu", "cortex-a57",
-    "-m", "256M",
+    "-cpu",     "cortex-a57",
+    "-m",       "256M",
     "-nographic",
-    "-serial", "mon:stdio",
+    "-serial",  "mon:stdio",
     "-kernel",
 ]
+rustflags = [
+    "-C", "linker=ld.lld",
+    "-C", "relocation-model=static",
+    "-C", "code-model=small",       # AArch64 only accepts small/tiny/large
+]
 
+# ── x86-64 — Limine UEFI on a FAT32 disk image ───────────────────────────────
+# The script downloads Limine once (cached in target/limine/), builds a fresh
+# disk image each run, and launches QEMU with OVMF.
+# Prerequisites (install once):
+#   sudo apt install ovmf dosfstools mtools qemu-system-x86
 [target.x86_64-unknown-none]
-runner = [
-    "qemu-system-x86_64",
-    "-machine", "q35",
-    "-m", "256M",
-    "-nographic",
-    "-serial", "mon:stdio",
-    "-kernel",
-]
-
-# ── Linker flags shared by all bare-metal targets ────────────────────────────
-# The linker script is injected by kernel/build.rs per target architecture.
-# lld is used because it handles --entry and cross-linking reliably.
-
-[target.'cfg(target_os = "none")']
+runner = "scripts/run-x86_64.sh"
 rustflags = [
     "-C", "linker=ld.lld",
     "-C", "relocation-model=static",

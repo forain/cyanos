@@ -3,6 +3,12 @@ name = "arch-aarch64"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Target Raspberry Pi 5 (BCM2712 + RP1).
+# Selects correct UART/GIC base addresses and UARTCLK divisors for RPi 5.
+# Without this flag the defaults target QEMU -machine virt.
+rpi5 = []
+
 [dependencies]
 cyanos-lib = { path = "../../lib" }
 mm      = { path = "../../mm" }

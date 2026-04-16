@@ -10,6 +10,8 @@ pub const MESSAGE_INLINE_BYTES: usize = 56;
 pub struct Message {
     /// Identifies the requested operation (server-defined).
     pub tag: u64,
+    /// Port to which the server should send its reply (set by sys_call; 0 = none).
+    pub reply_port: u32,
     /// Inline payload for small messages.
     pub data: [u8; MESSAGE_INLINE_BYTES],
     /// Optional shared-memory capability for large payloads.
@@ -18,6 +20,6 @@ pub struct Message {
 
 impl Message {
     pub const fn empty() -> Self {
-        Self { tag: 0, data: [0; MESSAGE_INLINE_BYTES], cap: None }
+        Self { tag: 0, reply_port: 0, data: [0; MESSAGE_INLINE_BYTES], cap: None }
     }
 }

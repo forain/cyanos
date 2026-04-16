@@ -6,5 +6,6 @@ edition.workspace = true
 [dependencies]
 cyanos-lib = { path = "../../lib" }
 ipc     = { path = "../../ipc" }
+mm      = { path = "../../mm" }
 bitflags.workspace = true
 spin.workspace = true

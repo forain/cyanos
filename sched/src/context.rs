@@ -10,14 +10,27 @@
 ///
 /// Only callee-saved state is stored here; the task is responsible for
 /// saving caller-saved registers before any blocking call.
+///
+/// FPU/SIMD state is always saved eagerly on every context switch.
+/// This is simpler than lazy-FPU (trap-on-use) and correct for all workloads.
 #[cfg(target_arch = "aarch64")]
 #[repr(C)]
 pub struct CpuContext {
     /// x19, x20, x21, x22, x23, x24, x25, x26, x27, x28, x29(fp), x30(lr)
-    /// Offsets: 0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88
+    /// Offsets: 0..96 (12 × 8 bytes)
     pub gregs: [u64; 12],
-    /// SP_EL1 — saved at offset 96.
+    /// SP_EL1 — offset 96.
     pub sp: u64,
+    /// Padding to 16-byte-align fpregs for `stp q` instructions — offset 104.
+    pub _pad: u64,
+    // ── AArch64 FP/SIMD (FEAT_FP + FEAT_AdvSIMD, mandatory from ARMv8.0) ────
+    /// SIMD/FP registers Q0-Q31, each 128 bits wide.
+    /// Offset: 112.  Total: 32 × 16 = 512 bytes.
+    pub fpregs: [u128; 32],
+    /// FPCR (floating-point control register) — offset 624.
+    pub fpcr: u64,
+    /// FPSR (floating-point status register) — offset 632.
+    pub fpsr: u64,
 }
 
 /// On all non-AArch64 targets (x86-64 and future ports).
@@ -26,16 +39,25 @@ pub struct CpuContext {
 pub struct CpuContext {
     /// Saved kernel stack pointer.
     /// rbx, rbp, r12–r15 are pushed onto the task's stack before rsp is saved.
+    /// Offset: 0.
     pub rsp: u64,
+    // ── x86-64 SSE/AVX state ─────────────────────────────────────────────────
+    /// XMM0-XMM15 (128-bit each).  Offset: 8.  Total: 16 × 16 = 256 bytes.
+    pub xmm: [u128; 16],
+    /// MXCSR (SSE control/status).  Offset: 264.
+    pub mxcsr: u32,
+    /// Padding to keep the struct size a multiple of 8 bytes.
+    pub _pad: u32,
 }
 
 impl CpuContext {
     /// A zeroed context, suitable as the initial scheduler idle context.
     pub const fn zeroed() -> Self {
         #[cfg(target_arch = "aarch64")]
-        { Self { gregs: [0u64; 12], sp: 0 } }
+        { Self { gregs: [0u64; 12], sp: 0, _pad: 0, fpregs: [0u128; 32], fpcr: 0, fpsr: 0 } }
         #[cfg(not(target_arch = "aarch64"))]
-        { Self { rsp: 0 } }
+        { Self { rsp: 0, xmm: [0u128; 16], mxcsr: 0x1F80, _pad: 0 } }
+        // mxcsr 0x1F80 = default SSE control: all exceptions masked, round-to-nearest
     }
 
     /// Build a context for a brand-new kernel-mode task.
@@ -78,30 +100,67 @@ impl CpuContext {
         }
     }
 
-    /// Build a context for a new user-mode task (AArch64 only).
+    /// Build a context for a new user-mode task.
     ///
-    /// When the scheduler first switches to this task, `cpu_switch_to` loads
-    /// x30 = `ret_to_user` and branches there via `ret`.  `ret_to_user` then
-    /// pops the three words below off the kernel stack and `eret`s to EL0.
+    /// **AArch64**: `cpu_switch_to` loads x30 = `ret_to_user` and branches there
+    /// via `ret`.  `ret_to_user` pops SP_EL0/ELR_EL1/SPSR_EL1 and `eret`s to EL0.
     ///
-    /// Kernel stack frame layout built here (from `kernel_stack_top - 24`):
+    /// **x86-64**: `cpu_switch_to` pops callee-saved regs, then `ret`s to
+    /// `iret_to_user`, which executes `iretq` into the IRET frame below it.
+    ///
+    /// AArch64 kernel stack layout (from `kernel_stack_top - 24`):
     ///   [ksp+0]:  SP_EL0   = user stack pointer
     ///   [ksp+8]:  ELR_EL1  = user entry point
     ///   [ksp+16]: SPSR_EL1 = 0 (EL0t, all interrupts unmasked)
-    #[cfg(target_arch = "aarch64")]
+    ///
+    /// x86-64 kernel stack layout (from `kernel_stack_top - 96`):
+    ///   [ksp+0..40]: callee-saved regs = 0 (rbx, rbp, r12-r15)
+    ///   [ksp+48]:    iret_to_user (ret target)
+    ///   [ksp+56]:    user RIP
+    ///   [ksp+64]:    user CS  = 0x23
+    ///   [ksp+72]:    user RFLAGS = 0x202 (IF set)
+    ///   [ksp+80]:    user RSP
+    ///   [ksp+88]:    user SS  = 0x1B
     pub fn new_user_task(user_entry: usize, user_sp: usize, kernel_stack_top: usize) -> Self {
-        extern "C" { fn ret_to_user(); }
-        let frame = kernel_stack_top.wrapping_sub(3 * 8);
-        unsafe {
-            let p = frame as *mut u64;
-            p.add(0).write(user_sp as u64);       // SP_EL0
-            p.add(1).write(user_entry as u64);    // ELR_EL1
-            p.add(2).write(0u64);                 // SPSR_EL1 = EL0t
+        #[cfg(target_arch = "x86_64")]
+        {
+            extern "C" { fn iret_to_user(); }
+            // Frame is 12 words (96 bytes) below stack top.
+            // Layout: 6 × callee-saved zeros | iret_to_user | IRET frame (5 words)
+            let frame = kernel_stack_top.wrapping_sub(12 * 8);
+            unsafe {
+                let p = frame as *mut u64;
+                p.add(0).write(0);                      // rbx
+                p.add(1).write(0);                      // rbp
+                p.add(2).write(0);                      // r12
+                p.add(3).write(0);                      // r13
+                p.add(4).write(0);                      // r14
+                p.add(5).write(0);                      // r15
+                p.add(6).write(iret_to_user as u64);    // ret target → iretq
+                p.add(7).write(user_entry as u64);      // IRET: user RIP
+                p.add(8).write(0x23);                   // IRET: user CS  (DPL 3, 64-bit)
+                p.add(9).write(0x202);                  // IRET: RFLAGS (IF=1)
+                p.add(10).write(user_sp as u64);        // IRET: user RSP
+                p.add(11).write(0x1B);                  // IRET: user SS  (DPL 3)
+            }
+            Self { rsp: frame as u64 }
         }
-        let mut c = Self::zeroed();
-        c.gregs[11] = ret_to_user as *const () as u64; // x30 → ret_to_user trampoline
-        c.sp        = frame as u64;
-        c
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            extern "C" { fn ret_to_user(); }
+            let frame = kernel_stack_top.wrapping_sub(3 * 8);
+            unsafe {
+                let p = frame as *mut u64;
+                p.add(0).write(user_sp as u64);     // SP_EL0
+                p.add(1).write(user_entry as u64);  // ELR_EL1
+                p.add(2).write(0u64);               // SPSR_EL1 = EL0t
+            }
+            let mut c = Self::zeroed();
+            c.gregs[11] = ret_to_user as *const () as u64;
+            c.sp        = frame as u64;
+            c
+        }
     }
 }
 
@@ -125,10 +184,18 @@ core::arch::global_asm!(r#"
 .global cpu_switch_to
 .type   cpu_switch_to, %function
 cpu_switch_to:
-    // x0 = *mut CpuContext (old):   gregs[0..11] @ byte 0..88, sp @ byte 96
+    // x0 = *mut CpuContext (old)
     // x1 = *const CpuContext (new)
+    //
+    // CpuContext layout (AArch64):
+    //   Bytes   0.. 88: gregs[0..11] (x19-x30, 12 × u64)
+    //   Byte       96:  sp            (u64)
+    //   Byte      104:  _pad          (u64, alignment padding)
+    //   Bytes 112..623: fpregs[0..31] (Q0-Q31, 32 × u128 = 512 bytes, 16-byte aligned)
+    //   Byte      624:  fpcr          (u64)
+    //   Byte      632:  fpsr          (u64)
 
-    // ── save outgoing task ───────────────────────────────────────────────────
+    // ── save outgoing integer registers ─────────────────────────────────────
     stp  x19, x20, [x0, #0]
     stp  x21, x22, [x0, #16]
     stp  x23, x24, [x0, #32]
@@ -138,30 +205,101 @@ cpu_switch_to:
     mov  x9,  sp
     str  x9,  [x0, #96]
 
-    // ── restore incoming task ────────────────────────────────────────────────
+    // ── save outgoing FP/SIMD registers ─────────────────────────────────────
+    add  x9, x0, #112            // x9 → fpregs[0] (16-byte aligned)
+    stp  q0,  q1,  [x9, #0]
+    stp  q2,  q3,  [x9, #32]
+    stp  q4,  q5,  [x9, #64]
+    stp  q6,  q7,  [x9, #96]
+    stp  q8,  q9,  [x9, #128]
+    stp  q10, q11, [x9, #160]
+    stp  q12, q13, [x9, #192]
+    stp  q14, q15, [x9, #224]
+    stp  q16, q17, [x9, #256]
+    stp  q18, q19, [x9, #288]
+    stp  q20, q21, [x9, #320]
+    stp  q22, q23, [x9, #352]
+    stp  q24, q25, [x9, #384]
+    stp  q26, q27, [x9, #416]
+    stp  q28, q29, [x9, #448]
+    stp  q30, q31, [x9, #480]
+    mrs  x10, fpcr
+    str  x10, [x0, #624]
+    mrs  x10, fpsr
+    str  x10, [x0, #632]
+
+    // ── restore incoming integer registers ───────────────────────────────────
     ldp  x19, x20, [x1, #0]
     ldp  x21, x22, [x1, #16]
     ldp  x23, x24, [x1, #32]
     ldp  x25, x26, [x1, #48]
     ldp  x27, x28, [x1, #64]
-    ldp  x29, x30, [x1, #80]    // x30 = return addr (existing) or entry (new)
+    ldp  x29, x30, [x1, #80]    // x30 = return addr or entry point
     ldr  x9,  [x1, #96]
     mov  sp,  x9
+
+    // ── restore incoming FP/SIMD registers ───────────────────────────────────
+    add  x9, x1, #112            // x9 → fpregs[0] (16-byte aligned)
+    ldp  q0,  q1,  [x9, #0]
+    ldp  q2,  q3,  [x9, #32]
+    ldp  q4,  q5,  [x9, #64]
+    ldp  q6,  q7,  [x9, #96]
+    ldp  q8,  q9,  [x9, #128]
+    ldp  q10, q11, [x9, #160]
+    ldp  q12, q13, [x9, #192]
+    ldp  q14, q15, [x9, #224]
+    ldp  q16, q17, [x9, #256]
+    ldp  q18, q19, [x9, #288]
+    ldp  q20, q21, [x9, #320]
+    ldp  q22, q23, [x9, #352]
+    ldp  q24, q25, [x9, #384]
+    ldp  q26, q27, [x9, #416]
+    ldp  q28, q29, [x9, #448]
+    ldp  q30, q31, [x9, #480]
+    ldr  x10, [x1, #624]
+    msr  fpcr, x10
+    ldr  x10, [x1, #632]
+    msr  fpsr, x10
 
     ret                          // branch to x30
 "#);
 
-// ─── x86-64 context switch (AT&T syntax) ──────────────────────────────────
+// ─── x86-64 context switch + user-mode trampoline (AT&T syntax) ───────────────
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(r#"
 .global cpu_switch_to
 .type   cpu_switch_to, @function
 cpu_switch_to:
-    // rdi = *mut CpuContext (old)   – CpuContext.rsp at offset 0
+    // rdi = *mut CpuContext (old)
     // rsi = *const CpuContext (new)
+    //
+    // CpuContext layout (x86-64):
+    //   Offset   0: rsp    (u64)
+    //   Offset   8: xmm[0..15] (16 × u128 = 256 bytes)
+    //   Offset 264: mxcsr  (u32)
+    //   Offset 268: _pad   (u32)
 
-    // Push callee-saved registers onto the outgoing task's kernel stack.
+    // ── save outgoing SSE/FPU state ──────────────────────────────────────────
+    movdqu %xmm0,  8(%rdi)
+    movdqu %xmm1,  24(%rdi)
+    movdqu %xmm2,  40(%rdi)
+    movdqu %xmm3,  56(%rdi)
+    movdqu %xmm4,  72(%rdi)
+    movdqu %xmm5,  88(%rdi)
+    movdqu %xmm6,  104(%rdi)
+    movdqu %xmm7,  120(%rdi)
+    movdqu %xmm8,  136(%rdi)
+    movdqu %xmm9,  152(%rdi)
+    movdqu %xmm10, 168(%rdi)
+    movdqu %xmm11, 184(%rdi)
+    movdqu %xmm12, 200(%rdi)
+    movdqu %xmm13, 216(%rdi)
+    movdqu %xmm14, 232(%rdi)
+    movdqu %xmm15, 248(%rdi)
+    stmxcsr 264(%rdi)
+
+    // ── save outgoing integer registers ──────────────────────────────────────
     pushq %rbx
     pushq %rbp
     pushq %r12
@@ -170,6 +308,7 @@ cpu_switch_to:
     pushq %r15
     movq  %rsp, (%rdi)      // save rsp into old->rsp
 
+    // ── restore incoming integer registers ───────────────────────────────────
     movq  (%rsi), %rsp      // load rsp from new->rsp
     popq  %r15
     popq  %r14
@@ -177,5 +316,39 @@ cpu_switch_to:
     popq  %r12
     popq  %rbp
     popq  %rbx
+
+    // ── restore incoming SSE/FPU state ───────────────────────────────────────
+    ldmxcsr 264(%rsi)
+    movdqu  8(%rsi),   %xmm0
+    movdqu  24(%rsi),  %xmm1
+    movdqu  40(%rsi),  %xmm2
+    movdqu  56(%rsi),  %xmm3
+    movdqu  72(%rsi),  %xmm4
+    movdqu  88(%rsi),  %xmm5
+    movdqu  104(%rsi), %xmm6
+    movdqu  120(%rsi), %xmm7
+    movdqu  136(%rsi), %xmm8
+    movdqu  152(%rsi), %xmm9
+    movdqu  168(%rsi), %xmm10
+    movdqu  184(%rsi), %xmm11
+    movdqu  200(%rsi), %xmm12
+    movdqu  216(%rsi), %xmm13
+    movdqu  232(%rsi), %xmm14
+    movdqu  248(%rsi), %xmm15
+
     retq                    // jump to return address / entry point
+
+// ── iret_to_user — first entry into a user-space task (x86-64) ───────────────
+//
+// Called via `retq` from cpu_switch_to when the kernel stack was built by
+// CpuContext::new_user_task.  On entry RSP points at the 5-word IRET frame:
+//   [rsp+0]:  user RIP
+//   [rsp+8]:  user CS  (0x23)
+//   [rsp+16]: user RFLAGS (0x202)
+//   [rsp+24]: user RSP
+//   [rsp+32]: user SS   (0x1b)
+.global iret_to_user
+.type   iret_to_user, @function
+iret_to_user:
+    iretq
 "#);

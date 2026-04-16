@@ -69,29 +69,53 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
         framebuffer_height:  0,
         framebuffer_pitch:   0,
         rsdp_addr:           0,
+        uart_base:           0,
     };
 
-    static mut MM: [MemoryRegion; 32] = [MemoryRegion {
+    // 64 slots: enough for all available regions + firmware memreserve entries.
+    static mut MM: [MemoryRegion; 64] = [MemoryRegion {
         base: 0, length: 0, kind: MemoryType::Reserved
-    }; 32];
+    }; 64];
     let mut mm_idx = 0usize;
 
     let hdr = dtb_phys as *const FdtHeader;
     if be32(dtb_phys as *const u8) != FDT_MAGIC { return info; }
 
-    let struct_off  = be32(core::ptr::addr_of!((*hdr).off_dt_struct) as *const u8) as usize;
-    let strings_off = be32(core::ptr::addr_of!((*hdr).off_dt_strings) as *const u8) as usize;
+    // totalsize is at offset 4 in the FDT header (big-endian u32).
+    let total_size  = be32((dtb_phys + 4) as *const u8) as usize;
+    // dtb_end marks the exclusive upper bound for all reads from this DTB.
+    // Any read at or beyond this address is out of range and must be rejected.
+    let dtb_end = dtb_phys + total_size;
+
+    let struct_off   = be32(core::ptr::addr_of!((*hdr).off_dt_struct)   as *const u8) as usize;
+    let strings_off  = be32(core::ptr::addr_of!((*hdr).off_dt_strings)  as *const u8) as usize;
+    let memrsv_off   = be32(core::ptr::addr_of!((*hdr).off_mem_rsvmap)  as *const u8) as usize;
+
+    // Validate that all block offsets lie within the DTB.
+    if struct_off  >= total_size { return info; }
+    if strings_off >= total_size { return info; }
 
     let struct_base  = dtb_phys + struct_off;
     let strings_base = dtb_phys + strings_off;
+    // Upper bound of the strings block (conservative: extends to dtb_end).
+    let strings_end  = dtb_end;
 
     let mut pos = struct_base;
     let mut depth = 0i32;
-    let mut in_memory = false;
+    let mut in_memory     = false;
+    let mut in_framebuf   = false;
+    let mut in_pl011      = false;
     let mut address_cells = 2u8;  // default: 2 × u32 = u64
-    let mut size_cells = 2u8;     // default: 2 × u32 = u64
+    let mut size_cells    = 2u8;  // default: 2 × u32 = u64
+    // Scratch: accumulate framebuffer fields from the /framebuffer node.
+    let mut fb_base:   u64 = 0;
+    let mut fb_width:  u32 = 0;
+    let mut fb_height: u32 = 0;
+    let mut fb_pitch:  u32 = 0;
 
     loop {
+        // Bounds check: need at least 4 bytes for the token.
+        if pos + 4 > dtb_end { break; }
         let token = be32(pos as *const u8);
         pos += 4;
 
@@ -100,13 +124,19 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                 // Node name is a null-terminated string.
                 let name_ptr = pos as *const u8;
                 let mut name_len = 0;
-                while *name_ptr.add(name_len) != 0 { name_len += 1; }
+                // Scan only within the DTB bounds to avoid unbounded reads.
+                while pos + name_len < dtb_end && *name_ptr.add(name_len) != 0 {
+                    name_len += 1;
+                }
                 let name = core::str::from_utf8(
                     core::slice::from_raw_parts(name_ptr, name_len)
                 ).unwrap_or("");
 
-                // Detect "memory" nodes (may be "memory@<addr>").
-                in_memory = name == "memory" || name.starts_with("memory@");
+                // Detect interesting node types by their base name.
+                in_memory   = name == "memory"      || name.starts_with("memory@");
+                in_framebuf = name == "framebuffer"  || name.starts_with("framebuffer@")
+                           || name.starts_with("simple-framebuffer@");
+                in_pl011    = name.starts_with("pl011@") || name.starts_with("uart@");
 
                 // Advance past the name (aligned to 4 bytes).
                 pos += (name_len + 1 + 3) & !3;
@@ -115,34 +145,98 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
 
             FDT_END_NODE => {
                 depth -= 1;
-                if depth == 1 { in_memory = false; }
+                if depth == 1 {
+                    in_memory   = false;
+                    in_framebuf = false;
+                    in_pl011    = false;
+                }
             }
 
             FDT_PROP => {
+                // Need 8 bytes for the prop header (data_len + name_off).
+                if pos + 8 > dtb_end { break; }
                 let data_len  = be32(pos as *const u8) as usize;
                 let name_off  = be32((pos + 4) as *const u8) as usize;
-                let data_ptr  = (pos + 8) as *const u8;
-                pos += 8 + (data_len + 3) & !3;
+                // Validate that the property data fits within the DTB.
+                // Use checked_add to guard against overflow from a malformed data_len.
+                let data_start = pos + 8;
+                let data_end   = match data_start.checked_add(data_len) {
+                    Some(e) => e,
+                    None    => break,
+                };
+                if data_end > dtb_end { break; }
+                let data_ptr  = data_start as *const u8;
+                pos += 8 + ((data_len + 3) & !3);
 
-                // Property name string from strings block.
-                let prop_name_ptr = (strings_base + name_off) as *const u8;
+                // Property name string from strings block: validate name_off.
+                let name_ptr_addr = strings_base + name_off;
+                if name_ptr_addr >= strings_end { continue; }
+                let prop_name_ptr = name_ptr_addr as *const u8;
                 let mut pn_len = 0;
-                while *prop_name_ptr.add(pn_len) != 0 { pn_len += 1; }
+                // Scan only within the strings block bounds.
+                while name_ptr_addr + pn_len < strings_end
+                    && *prop_name_ptr.add(pn_len) != 0
+                {
+                    pn_len += 1;
+                }
                 let prop_name = core::str::from_utf8(
                     core::slice::from_raw_parts(prop_name_ptr, pn_len)
                 ).unwrap_or("");
 
                 match prop_name {
-                    "#address-cells" if data_len >= 4 => {
+                    // #address-cells / #size-cells are inheritable: every node
+                    // can define them for *its children*.  We only care about the
+                    // root node's values (depth == 1) because that controls how
+                    // /memory@, /pl011@, and /framebuffer@ children encode their
+                    // "reg" properties.  Sub-nodes like /cpus (which sets
+                    // #address-cells = <1> for cpu@ children) must not overwrite
+                    // the root values we rely on for memory-map parsing.
+                    "#address-cells" if data_len >= 4 && depth == 1 => {
                         address_cells = be32(data_ptr) as u8;
                     }
-                    "#size-cells" if data_len >= 4 => {
+                    "#size-cells" if data_len >= 4 && depth == 1 => {
                         size_cells = be32(data_ptr) as u8;
                     }
+
+                    // ── Framebuffer node ──────────────────────────────────────
+                    // QEMU virt exposes a simple-framebuffer node with:
+                    //   reg       = <base size>
+                    //   width     = <u32>
+                    //   height    = <u32>
+                    //   stride    = <u32>   (bytes per row)
+                    "reg" if in_framebuf && data_len >= 8 => {
+                        fb_base = if address_cells >= 2 {
+                            be64(data_ptr)
+                        } else {
+                            be32(data_ptr) as u64
+                        };
+                    }
+                    "width"  if in_framebuf && data_len >= 4 => { fb_width  = be32(data_ptr); }
+                    "height" if in_framebuf && data_len >= 4 => { fb_height = be32(data_ptr); }
+                    "stride" if in_framebuf && data_len >= 4 => { fb_pitch  = be32(data_ptr); }
+
+                    // ── PL011 UART node ───────────────────────────────────────
+                    // "reg" gives the MMIO base address.  Only the first PL011
+                    // found is recorded; kernel_main uses it to set the serial
+                    // console base when the DTB path is active.
+                    "reg" if in_pl011 && data_len >= 4 => {
+                        if info.uart_base == 0 {
+                            info.uart_base = if address_cells >= 2 {
+                                be64(data_ptr)
+                            } else {
+                                be32(data_ptr) as u64
+                            };
+                        }
+                    }
+
                     "reg" if in_memory && mm_idx < 32 => {
                         // "reg" = list of (address, size) pairs.
                         // Each address is address_cells × u32, size is size_cells × u32.
                         let entry_bytes = (address_cells + size_cells) as usize * 4;
+                        // Guard: a zero entry_bytes would loop forever since `off`
+                        // never advances.  A well-formed DTB always has both
+                        // address_cells ≥ 1 and size_cells ≥ 1 for memory nodes.
+                        if entry_bytes == 0 { break; }
                         let mut off = 0;
                         while off + entry_bytes <= data_len {
                             let base = if address_cells == 2 {
@@ -173,7 +267,47 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
         }
     }
 
-    info.memory_map     = core::ptr::addr_of!(MM) as *const MemoryRegion;
-    info.memory_map_len = mm_idx;
+    // ── Memory reservation map ───────────────────────────────────────────────
+    //
+    // The FDT memory reservation map (off_mem_rsvmap) lists physical address
+    // ranges that must NOT be used by the OS — typically firmware-private
+    // regions such as ARM Trusted Firmware (ATF/BL31) at 0x0, VideoCore
+    // shared buffers on RPi5, PSCI table, etc.
+    //
+    // Each entry is a pair of big-endian u64 (address, size).
+    // The list is terminated by an all-zero entry.
+    //
+    // We add these to the MM array as MemoryType::Reserved so the buddy
+    // allocator (which skips non-Available entries) leaves them alone.
+    if memrsv_off < total_size {
+        let mut rsvpos = dtb_phys + memrsv_off;
+        loop {
+            // Need 16 bytes for one entry.
+            if rsvpos + 16 > dtb_end { break; }
+            let rsv_base = be64(rsvpos as *const u8);
+            let rsv_size = be64((rsvpos + 8) as *const u8);
+            // All-zero entry terminates the list (FDT spec §5.3.2).
+            if rsv_base == 0 && rsv_size == 0 { break; }
+            if mm_idx < 64 {
+                MM[mm_idx] = MemoryRegion {
+                    base:   rsv_base,
+                    length: rsv_size,
+                    kind:   MemoryType::Reserved,
+                };
+                mm_idx += 1;
+            }
+            rsvpos += 16;
+        }
+    }
+
+    info.memory_map      = core::ptr::addr_of!(MM) as *const MemoryRegion;
+    info.memory_map_len  = mm_idx;
+    // Populate framebuffer fields if a framebuffer node was found.
+    if fb_base != 0 {
+        info.framebuffer_base   = fb_base;
+        info.framebuffer_width  = fb_width;
+        info.framebuffer_height = fb_height;
+        info.framebuffer_pitch  = fb_pitch;
+    }
     info
 }

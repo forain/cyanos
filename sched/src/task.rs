@@ -1,6 +1,7 @@
 //! Task (process/thread) descriptor — analogous to Linux `task_struct`.
 
 use crate::context::CpuContext;
+use mm::vmm::AddressSpace;
 
 pub type Pid = u32;
 
@@ -24,6 +25,13 @@ pub struct Task {
     pub kernel_stack: usize,
     /// IPC port this task is sleeping on (Some when state == Blocked).
     pub blocked_on:   Option<u32>,
+    /// Per-process virtual address space (None for kernel tasks).
+    pub address_space: Option<AddressSpace>,
+    /// Exit status set by `exit()`.  Valid only when `state == Zombie`.
+    pub exit_code:    i32,
+    /// Dedicated reply port for sys_call.  Allocated at spawn; freed on exit.
+    /// `u32::MAX` = not yet allocated.
+    pub reply_port:   u32,
 }
 
 impl Task {
@@ -47,6 +55,9 @@ impl Task {
             page_table,
             kernel_stack: stack_base,
             blocked_on:   None,
+            address_space: None,
+            exit_code:    0,
+            reply_port:   u32::MAX, // allocated lazily on first sys_call
         }
     }
 }

@@ -45,11 +45,47 @@ unsafe fn early_serial_init() {
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn early_serial_init() {
-    // QEMU virt UART0 is PL011 at 0x09000000.
-    // CR register: enable TX (bit 8) + enable UART (bit 0).
-    let base = 0x09000000usize;
-    let cr = (base + 0x30) as *mut u32;
-    cr.write_volatile(0x0301); // UARTEN | TXE
+    // PL011 bring-up before the arch crate's full init() runs.
+    // Board base addresses:
+    //   QEMU virt  : 0x09000000   (ref clock 24 MHz from DTB)
+    //   RPi 5 RP1  : 0x107D001000 (ref clock 48 MHz from RP1 clock tree)
+
+    #[cfg(not(feature = "rpi5"))]
+    {
+        // QEMU: PL011 is permissive about baud rate; just enable TX.
+        let base = 0x09000000usize;
+        let cr = (base + 0x30) as *mut u32;
+        cr.write_volatile(0x0301); // UARTEN | TXE | RXE
+    }
+
+    #[cfg(feature = "rpi5")]
+    {
+        // RPi5 RP1 PL011 full bringup sequence (PL011 TRM §3.3.6).
+        // Reference clock: 48 MHz.
+        // Target baud: 115200.
+        // BRD = 48_000_000 / (16 × 115_200) = 26.042…
+        //   IBRD = 26
+        //   FBRD = round(0.042 × 64) = 3
+        let base = 0x107D_0010_00usize;
+
+        // 1. Disable UART while reconfiguring (CR = 0).
+        let cr   = (base + 0x30) as *mut u32;
+        cr.write_volatile(0);
+
+        // 2. Set integer and fractional baud-rate divisors.
+        let ibrd = (base + 0x24) as *mut u32;
+        let fbrd = (base + 0x28) as *mut u32;
+        ibrd.write_volatile(26);
+        fbrd.write_volatile(3);
+
+        // 3. Program line control: 8-bit words, FIFO enabled, no parity, 1
+        //    stop bit (LCRH bits [6:5]=11 WLEN=8, bit[4]=1 FEN).
+        let lcrh = (base + 0x2C) as *mut u32;
+        lcrh.write_volatile(0x70); // 0b0111_0000
+
+        // 4. Enable UART, TX, and RX.
+        cr.write_volatile(0x0301); // UARTEN | TXE | RXE
+    }
 }
 
 unsafe fn serial_write_byte(b: u8) {
@@ -68,7 +104,11 @@ unsafe fn serial_write_byte(b: u8) {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        let base = 0x09000000usize;
+        // Select UART base to match the board compiled for.
+        #[cfg(not(feature = "rpi5"))]
+        let base = 0x09000000usize;       // QEMU virt PL011
+        #[cfg(feature = "rpi5")]
+        let base = 0x107D_0010_00usize;   // RPi5 RP1 PL011
         // Wait until TX FIFO not full (FR register bit 5 = TXFF).
         let fr = (base + 0x18) as *const u32;
         while fr.read_volatile() & (1 << 5) != 0 {}
@@ -123,9 +163,21 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     { arch_aarch64::init(); }
 
     // 3. Parse boot information into a unified BootInfo.
+    //    x86-64: Limine UEFI bootloader — info comes from static request
+    //            structs filled by Limine before jumping to _start.
+    //            boot_info_addr is 0 (unused) in the Limine entry.
+    //    AArch64: device tree blob address passed in x0 by firmware.
+    //             A zero address means firmware did not supply a DTB —
+    //             this is a fatal misconfiguration (no memory map).
+    #[cfg(target_arch = "aarch64")]
+    if boot_info_addr == 0 {
+        panic!("kernel_main: no DTB from firmware (x0 == 0); \
+                check config.txt device_tree= setting");
+    }
+
     let boot_info = unsafe {
         #[cfg(target_arch = "x86_64")]
-        { boot::multiboot2::parse(boot_info_addr) }
+        { boot::limine::parse() }
         #[cfg(target_arch = "aarch64")]
         { boot::device_tree::parse(boot_info_addr) }
     };
@@ -133,6 +185,26 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     serial_print("[CYANOS] memory map: ");
     print_hex(boot_info.total_available_memory());
     serial_print(" bytes available\n");
+
+    // 4a. Re-initialise serial if the DTB reported a different UART base.
+    //     On QEMU virt the DTB advertises /pl011@9000000; on other boards
+    //     the address differs.  Skip for x86-64 (fixed COM1) and RPi 5
+    //     (address already compiled in via the rpi5 feature).
+    #[cfg(all(target_arch = "aarch64", not(feature = "rpi5")))]
+    if boot_info.uart_base != 0 {
+        unsafe { arch_aarch64::uart::reinit(boot_info.uart_base as usize); }
+    }
+
+    // 4b. Register framebuffer parameters discovered from boot info so that
+    //     the framebuffer driver can initialise itself during probe().
+    if boot_info.framebuffer_base != 0 {
+        drivers::framebuffer::set_boot_framebuffer(
+            boot_info.framebuffer_base,
+            boot_info.framebuffer_width,
+            boot_info.framebuffer_height,
+            boot_info.framebuffer_pitch,
+        );
+    }
 
     // 4. Initialise the physical memory manager from the memory map.
     mm::init_with_map(boot_info.memory_regions());

@@ -1,16 +1,27 @@
-//! ARM GICv2 generic interrupt controller driver.
+//! ARM GICv2 / GIC-400 generic interrupt controller driver.
 //!
-//! QEMU -machine virt maps GICv2 at:
+//! **QEMU -machine virt** (default):
 //!   GICD (distributor)    0x0800_0000
 //!   GICC (CPU interface)  0x0801_0000
+//!
+//! **Raspberry Pi 5 (BCM2712 GIC-400)** — enabled by the `rpi5` cargo feature:
+//!   GICD (distributor)    0x107F_FF90_00
+//!   GICC (CPU interface)  0x107F_FFA0_00
 //!
 //! We enable PPI #30 (EL1 physical timer, CNTP) so the generic timer can
 //! deliver IRQs to CPU 0.
 //!
 //! Ref: ARM GIC Architecture Specification v2.0
 
+#[cfg(not(feature = "rpi5"))]
 const GICD_BASE: usize = 0x0800_0000;
+#[cfg(not(feature = "rpi5"))]
 const GICC_BASE: usize = 0x0801_0000;
+
+#[cfg(feature = "rpi5")]
+const GICD_BASE: usize = 0x107F_FF90_00;
+#[cfg(feature = "rpi5")]
+const GICC_BASE: usize = 0x107F_FFA0_00;
 
 // Distributor register offsets
 const GICD_CTLR:       usize = 0x000; // distributor control
@@ -44,15 +55,26 @@ unsafe fn gicc_w32(off: usize, v: u32) {
 
 // ── Public API ────────────────────────────────────────────────────────────
 
+/// Issue a data synchronization barrier for device (store) ordering.
+///
+/// Required after writes to GIC MMIO registers to ensure the write has
+/// propagated to the peripheral before the caller continues.
+#[inline]
+unsafe fn dsb_st() {
+    core::arch::asm!("dsb st", options(nomem, nostack));
+}
+
 /// Initialise GICv2 and enable PPI #30 (EL1 physical timer).
 pub fn init() {
     unsafe {
         // Enable distributor.
         gicd_w32(GICD_CTLR, 1);
+        dsb_st();
 
         // Enable PPI 30.  GICD_ISENABLER[0] is a write-set register covering
         // IRQ IDs 0-31; writing a 1 to bit N enables IRQ N.
         gicd_w32(GICD_ISENABLER0, 1 << 30);
+        dsb_st();
 
         // Priority for IRQ 30 (mid-priority = 0xA0).
         // IPRIORITYR is byte-addressed: IRQ 30 lives at byte 30 = word 7, byte 2.
@@ -60,6 +82,7 @@ pub fn init() {
         let pri_shift    = (30 % 4) * 8;
         let pri_v = (gicd_r32(pri_word_off) & !(0xFF << pri_shift)) | (0xA0 << pri_shift);
         gicd_w32(pri_word_off, pri_v);
+        dsb_st();
 
         // Route IRQ 30 to CPU 0.
         // ITARGETSR is byte-addressed similarly; bit 0 of the byte = CPU 0.
@@ -67,11 +90,25 @@ pub fn init() {
         let tgt_shift    = (30 % 4) * 8;
         let tgt_v = (gicd_r32(tgt_word_off) & !(0xFF << tgt_shift)) | (0x01 << tgt_shift);
         gicd_w32(tgt_word_off, tgt_v);
+        dsb_st();
 
         // Enable CPU interface.
         gicc_w32(GICC_CTLR, 1);
         // Accept any priority (mask = 0xFF = accept all).
         gicc_w32(GICC_PMR, 0xFF);
+        dsb_st();
+    }
+}
+
+/// Initialise only the CPU interface for a secondary CPU (AP).
+///
+/// The distributor was already configured by the BSP; each AP must separately
+/// enable its own banked CPU interface registers.
+pub fn init_cpu_interface() {
+    unsafe {
+        gicc_w32(GICC_CTLR, 1);    // enable CPU interface
+        gicc_w32(GICC_PMR,  0xFF); // accept all priorities
+        dsb_st();
     }
 }
 

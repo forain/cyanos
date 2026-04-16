@@ -206,6 +206,8 @@ pub struct Mac80211<D: Ieee80211Ops> {
     state:     StaConnState,
     current_bss: Option<Bss>,
     own_addr:  MacAddr,
+    /// IPC port to notify on association events (nl80211 userspace daemon).
+    nl80211_port: Option<ipc::Port>,
 }
 
 impl<D: Ieee80211Ops> Mac80211<D> {
@@ -215,7 +217,13 @@ impl<D: Ieee80211Ops> Mac80211<D> {
             state: StaConnState::Disconnected,
             current_bss: None,
             own_addr: addr,
+            nl80211_port: None,
         }
+    }
+
+    /// Register the IPC port that the nl80211 userspace daemon listens on.
+    pub fn set_nl80211_port(&mut self, port: ipc::Port) {
+        self.nl80211_port = Some(port);
     }
 
     pub fn state(&self) -> StaConnState { self.state }
