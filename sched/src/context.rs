@@ -31,6 +31,11 @@ pub struct CpuContext {
     pub fpcr: u64,
     /// FPSR (floating-point status register) — offset 632.
     pub fpsr: u64,
+    /// TPIDR_EL0 — user-space thread-pointer register — offset 640.
+    /// Used by musl/pthreads as the TLS base pointer.
+    pub tpidr_el0: u64,
+    /// Padding to maintain 8-byte struct alignment — offset 648.
+    pub _pad2: u64,
 }
 
 /// On all non-AArch64 targets (x86-64 and future ports).
@@ -46,18 +51,25 @@ pub struct CpuContext {
     pub xmm: [u128; 16],
     /// MXCSR (SSE control/status).  Offset: 264.
     pub mxcsr: u32,
-    /// Padding to keep the struct size a multiple of 8 bytes.
+    /// Padding — offset 268.
     pub _pad: u32,
+    /// FS.base — thread-local storage pointer for musl/pthreads — offset 272.
+    /// Saved/restored via RDMSR/WRMSR on MSR_FS_BASE (0xC000_0100).
+    pub fs_base: u64,
 }
 
 impl CpuContext {
     /// A zeroed context, suitable as the initial scheduler idle context.
     pub const fn zeroed() -> Self {
         #[cfg(target_arch = "aarch64")]
-        { Self { gregs: [0u64; 12], sp: 0, _pad: 0, fpregs: [0u128; 32], fpcr: 0, fpsr: 0 } }
+        { Self {
+            gregs: [0u64; 12], sp: 0, _pad: 0,
+            fpregs: [0u128; 32], fpcr: 0, fpsr: 0,
+            tpidr_el0: 0, _pad2: 0,
+        } }
         #[cfg(not(target_arch = "aarch64"))]
-        { Self { rsp: 0, xmm: [0u128; 16], mxcsr: 0x1F80, _pad: 0 } }
         // mxcsr 0x1F80 = default SSE control: all exceptions masked, round-to-nearest
+        { Self { rsp: 0, xmm: [0u128; 16], mxcsr: 0x1F80, _pad: 0, fs_base: 0 } }
     }
 
     /// Build a context for a brand-new kernel-mode task.
@@ -96,7 +108,9 @@ impl CpuContext {
                 p.add(5).write(0);
                 p.add(6).write(entry as u64);
             }
-            Self { rsp: frame as u64 }
+            let mut c = Self::zeroed();
+            c.rsp = frame as u64;
+            c
         }
     }
 
@@ -143,7 +157,9 @@ impl CpuContext {
                 p.add(10).write(user_sp as u64);        // IRET: user RSP
                 p.add(11).write(0x1B);                  // IRET: user SS  (DPL 3)
             }
-            Self { rsp: frame as u64 }
+            let mut c = Self::zeroed();
+            c.rsp = frame as u64;
+            c
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -162,6 +178,38 @@ impl CpuContext {
             c
         }
     }
+}
+
+/// Full user-register frame saved by the AArch64 EL0 synchronous exception
+/// handler at the top of the kernel stack on every EL0→EL1 transition.
+///
+/// Layout matches the `sub sp, sp, #272` frame in `exc_el0_sync`:
+///
+/// | Offset | Field      | Description                         |
+/// |--------|------------|-------------------------------------|
+/// |   0    | x[0..=30]  | General-purpose registers x0–x30    |
+/// |  248   | sp_el0     | User stack pointer at exception entry|
+/// |  256   | elr_el1    | User PC (return address after SVC)  |
+/// |  264   | spsr_el1   | User PSTATE                         |
+///
+/// Total size: 272 bytes (17 × 16 — 16-byte aligned).
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+pub struct UserFrame {
+    /// General-purpose registers x0–x30 (31 × 8 = 248 bytes).
+    pub x:        [u64; 31],
+    /// User stack pointer saved by the EL0 exception stub.
+    pub sp_el0:   u64,
+    /// ELR_EL1: user-space return address (instruction after SVC).
+    pub elr_el1:  u64,
+    /// SPSR_EL1: saved user PSTATE.
+    pub spsr_el1: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl UserFrame {
+    /// Byte size of the frame — must match the `sub sp, sp, #272` in asm.
+    pub const SIZE: usize = core::mem::size_of::<Self>();
 }
 
 extern "C" {
@@ -227,6 +275,9 @@ cpu_switch_to:
     str  x10, [x0, #624]
     mrs  x10, fpsr
     str  x10, [x0, #632]
+    // Save user-space TLS pointer (TPIDR_EL0) — offset 640.
+    mrs  x10, tpidr_el0
+    str  x10, [x0, #640]
 
     // ── restore incoming integer registers ───────────────────────────────────
     ldp  x19, x20, [x1, #0]
@@ -260,6 +311,9 @@ cpu_switch_to:
     msr  fpcr, x10
     ldr  x10, [x1, #632]
     msr  fpsr, x10
+    // Restore user-space TLS pointer (TPIDR_EL0) — offset 640.
+    ldr  x10, [x1, #640]
+    msr  tpidr_el0, x10
 
     ret                          // branch to x30
 "#);
@@ -279,6 +333,14 @@ cpu_switch_to:
     //   Offset   8: xmm[0..15] (16 × u128 = 256 bytes)
     //   Offset 264: mxcsr  (u32)
     //   Offset 268: _pad   (u32)
+
+    // ── save FS.base (TLS pointer) via RDMSR on MSR_FS_BASE (0xC0000100) ─────
+    // RDMSR: ecx=MSR, returns edx:eax.  Combine into rax then store at offset 272.
+    movl  $0xC0000100, %ecx
+    rdmsr
+    shlq  $32, %rdx
+    orq   %rdx, %rax
+    movq  %rax, 272(%rdi)
 
     // ── save outgoing SSE/FPU state ──────────────────────────────────────────
     movdqu %xmm0,  8(%rdi)
@@ -335,6 +397,14 @@ cpu_switch_to:
     movdqu  216(%rsi), %xmm13
     movdqu  232(%rsi), %xmm14
     movdqu  248(%rsi), %xmm15
+
+    // ── restore FS.base (TLS pointer) via WRMSR on MSR_FS_BASE ──────────────
+    // WRMSR: ecx=MSR, edx:eax=value.  Load from offset 272.
+    movq  272(%rsi), %rax
+    movq  %rax, %rdx
+    shrq  $32, %rdx
+    movl  $0xC0000100, %ecx
+    wrmsr
 
     retq                    // jump to return address / entry point
 

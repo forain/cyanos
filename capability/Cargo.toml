@@ -1,0 +1,7 @@
+[package]
+name = "capability"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+spin.workspace = true

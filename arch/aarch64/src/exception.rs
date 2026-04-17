@@ -180,56 +180,130 @@ exc_el1_sync:
 
 // ── EL0-64 synchronous exception (SVC / user fault) ───────────────────────
 //
-// Stack layout after the stp sequence (SP grows down, lowest addr = top):
-//   [sp+ 0]: x8   [sp+ 8]: x9
-//   [sp+16]: x6   [sp+24]: x7
-//   [sp+32]: x4   [sp+40]: x5
-//   [sp+48]: x2   [sp+56]: x3
-//   [sp+64]: x0   [sp+72]: x1
-//   [sp+80]: x29  [sp+88]: x30
+// Saves the COMPLETE user register state into a UserFrame on the kernel stack:
+//
+//   UserFrame layout (272 bytes, 16-byte aligned):
+//   [sp+  0]: x0        [sp+  8]: x1
+//   [sp+ 16]: x2        [sp+ 24]: x3
+//   [sp+ 32]: x4        [sp+ 40]: x5
+//   [sp+ 48]: x6        [sp+ 56]: x7
+//   [sp+ 64]: x8        [sp+ 72]: x9
+//   [sp+ 80]: x10       [sp+ 88]: x11
+//   [sp+ 96]: x12       [sp+104]: x13
+//   [sp+112]: x14       [sp+120]: x15
+//   [sp+128]: x16       [sp+136]: x17
+//   [sp+144]: x18       [sp+152]: x19
+//   [sp+160]: x20       [sp+168]: x21
+//   [sp+176]: x22       [sp+184]: x23
+//   [sp+192]: x24       [sp+200]: x25
+//   [sp+208]: x26       [sp+216]: x27
+//   [sp+224]: x28       [sp+232]: x29
+//   [sp+240]: x30
+//   [sp+248]: sp_el0
+//   [sp+256]: elr_el1   (user PC after SVC)
+//   [sp+264]: spsr_el1
+//
+// syscall_dispatch receives 8 arguments:
+//   x0=number, x1=a0, x2=a1, x3=a2, x4=a3, x5=a4, x6=a5, x7=frame_ptr
 exc_el0_sync:
-    // Reload SP_EL1 to the task's kernel stack top (via TPIDR_EL1).
-    // This ensures a fresh kernel stack frame on every EL0→EL1 entry,
-    // regardless of any prior depth on SP_EL1.
     reload_kernel_sp
-    // Save caller-saved GPRs onto the kernel stack (SP_EL1 is used here).
-    stp  x29, x30, [sp, #-16]!
-    stp  x0,  x1,  [sp, #-16]!
-    stp  x2,  x3,  [sp, #-16]!
-    stp  x4,  x5,  [sp, #-16]!
-    stp  x6,  x7,  [sp, #-16]!
-    stp  x8,  x9,  [sp, #-16]!
+    // Allocate UserFrame (272 bytes).
+    sub  sp, sp, #272
+    // Save x0-x29 as 15 pairs.
+    stp  x0,  x1,  [sp, #0]
+    stp  x2,  x3,  [sp, #16]
+    stp  x4,  x5,  [sp, #32]
+    stp  x6,  x7,  [sp, #48]
+    stp  x8,  x9,  [sp, #64]
+    stp  x10, x11, [sp, #80]
+    stp  x12, x13, [sp, #96]
+    stp  x14, x15, [sp, #112]
+    stp  x16, x17, [sp, #128]
+    stp  x18, x19, [sp, #144]
+    stp  x20, x21, [sp, #160]
+    stp  x22, x23, [sp, #176]
+    stp  x24, x25, [sp, #192]
+    stp  x26, x27, [sp, #208]
+    stp  x28, x29, [sp, #224]
+    // Save x30 alone (odd register after 15 pairs).
+    str  x30,      [sp, #240]
+    // Save system registers (x9 is already saved at [sp+72]).
+    mrs  x9, sp_el0
+    str  x9,       [sp, #248]
+    mrs  x9, elr_el1
+    str  x9,       [sp, #256]
+    mrs  x9, spsr_el1
+    str  x9,       [sp, #264]
 
-    // Check EC field (ESR_EL1[31:26]). EC 0x15 = SVC AArch64.
-    mrs  x9,  esr_el1
-    lsr  x9,  x9,  #26
-    cmp  x9,  #0x15
+    // Determine exception class.
+    mrs  x9, esr_el1
+    lsr  x9, x9, #26
+    cmp  x9, #0x15           // EC 0x15 = SVC AArch64
     b.ne exc_el0_fault
 
-    // SVC: x0-x2 = user args a0/a1/a2, x8 = syscall number — still live.
-    // Build syscall_dispatch(number, a0, a1, a2) in x0-x3.
-    // Rearrange without clobbering a live source before reading it:
-    mov  x3,  x2              // a2 → x3
-    mov  x2,  x1              // a1 → x2
-    mov  x1,  x0              // a0 → x1
-    mov  x0,  x8              // syscall number → x0
-    bl   syscall_dispatch     // returns result in x0
-    // Store return value into the saved x0 slot so it is restored by eret.
-    str  x0,  [sp, #64]
+    // SVC: before: x0=a0, x1=a1, x2=a2, x3=a3, x4=a4, x5=a5, x8=number
+    // Build syscall_dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr).
+    // Rearrange high-to-low to avoid overwriting live sources:
+    //   x7 = sp (frame_ptr, captured before x5 is overwritten)
+    //   x6 = a5 (from x5)
+    //   x5 = a4 (from x4)
+    //   x4 = a3 (from x3)
+    //   x3 = a2 (from x2)
+    //   x2 = a1 (from x1)
+    //   x1 = a0 (from x0)
+    //   x0 = syscall number (from x8)
+    mov  x7,  sp
+    mov  x6,  x5
+    mov  x5,  x4
+    mov  x4,  x3
+    mov  x3,  x2
+    mov  x2,  x1
+    mov  x1,  x0
+    mov  x0,  x8
+    bl   syscall_dispatch    // result in x0
+    // Store return value into saved-x0 slot so eret restores it.
+    str  x0,  [sp, #0]
+
+    // Check and deliver any pending signals before returning to user space.
+    // x0 = frame_ptr = sp (points to the UserFrame we just saved).
+    // check_and_deliver_signals may modify the frame in-place to redirect
+    // execution to a signal handler.
+    mov  x0,  sp
+    bl   check_and_deliver_signals
+
     b    exc_el0_return
 
 exc_el0_fault:
-    mrs  x0,  esr_el1
-    mrs  x1,  elr_el1
-    bl   exc_el0_fault_handler   // panics; falls through to exc_el0_return
+    mrs  x0, esr_el1
+    mrs  x1, elr_el1
+    bl   exc_el0_fault_handler
 
 exc_el0_return:
-    ldp  x8,  x9,  [sp], #16
-    ldp  x6,  x7,  [sp], #16
-    ldp  x4,  x5,  [sp], #16
-    ldp  x2,  x3,  [sp], #16
-    ldp  x0,  x1,  [sp], #16
-    ldp  x29, x30, [sp], #16
+    // Restore system registers (x9 as scratch; its saved value is at [sp+72]).
+    ldr  x9, [sp, #264]
+    msr  spsr_el1, x9
+    ldr  x9, [sp, #256]
+    msr  elr_el1,  x9
+    ldr  x9, [sp, #248]
+    msr  sp_el0,   x9
+    // Restore all GPRs.
+    ldp  x0,  x1,  [sp, #0]
+    ldp  x2,  x3,  [sp, #16]
+    ldp  x4,  x5,  [sp, #32]
+    ldp  x6,  x7,  [sp, #48]
+    ldp  x8,  x9,  [sp, #64]
+    ldp  x10, x11, [sp, #80]
+    ldp  x12, x13, [sp, #96]
+    ldp  x14, x15, [sp, #112]
+    ldp  x16, x17, [sp, #128]
+    ldp  x18, x19, [sp, #144]
+    ldp  x20, x21, [sp, #160]
+    ldp  x22, x23, [sp, #176]
+    ldp  x24, x25, [sp, #192]
+    ldp  x26, x27, [sp, #208]
+    ldp  x28, x29, [sp, #224]
+    ldr  x30,      [sp, #240]
+    add  sp,  sp,  #272
     eret
 
 // ── Unexpected exception ──────────────────────────────────────────────────
@@ -238,28 +312,117 @@ exc_unexpected:
     mrs  x1, elr_el1
     bl   exc_unexpected_handler  // panics
 
-// ── ret_to_user — first entry into a user-space task ──────────────────────
+// ── ret_to_user — first entry into a new user-space task ──────────────────
 //
-// The scheduler's cpu_switch_to stores ret_to_user as x30 (lr) in the task
-// context, so the `ret` at the end of cpu_switch_to jumps here.
-//
-// On entry the kernel stack contains (built by CpuContext::new_user_task):
+// Called via cpu_switch_to (x30 = ret_to_user in the task's CpuContext).
+// The kernel stack contains 3 words built by CpuContext::new_user_task:
 //   [sp+0]:  SP_EL0   (user stack pointer)
 //   [sp+8]:  ELR_EL1  (user entry point)
-//   [sp+16]: SPSR_EL1 (0x00000000 = EL0t, all interrupts unmasked)
+//   [sp+16]: SPSR_EL1 (0 = EL0t, all interrupts unmasked)
 .global ret_to_user
 .type   ret_to_user, %function
 ret_to_user:
     ldr  x0, [sp], #8
-    msr  sp_el0,   x0       // user stack pointer
+    msr  sp_el0,   x0
     ldr  x0, [sp], #8
-    msr  elr_el1,  x0       // user entry point
+    msr  elr_el1,  x0
     ldr  x0, [sp], #8
-    msr  spsr_el1, x0       // saved program status (EL0t)
+    msr  spsr_el1, x0
     dsb  sy
     isb
-    mov  x0, #0             // clear x0 (first user argument)
-    eret                    // switch to EL0 at ELR_EL1
+    mov  x0, #0             // fork / spawn returns 0 in child / new task
+    eret
+
+// ── ret_to_user_fork — resume a forked child from a full UserFrame ─────────
+//
+// Called via cpu_switch_to (x30 = ret_to_user_fork) when the child task is
+// scheduled for the first time.  SP points to a UserFrame (272 bytes) that
+// was copied from the parent at fork time, with x[0] already zeroed.
+//
+// UserFrame layout (matches exc_el0_sync save sequence above):
+//   [sp+  0..239]: x0-x30 (31 × 8 bytes)
+//   [sp+248]:      sp_el0
+//   [sp+256]:      elr_el1
+//   [sp+264]:      spsr_el1
+.global ret_to_user_fork
+.type   ret_to_user_fork, %function
+ret_to_user_fork:
+    // Restore system registers using x9 as scratch.
+    ldr  x9, [sp, #264]
+    msr  spsr_el1, x9
+    ldr  x9, [sp, #256]
+    msr  elr_el1,  x9
+    ldr  x9, [sp, #248]
+    msr  sp_el0,   x9
+    // Restore GPRs (x9 restored from stack after its use as scratch above).
+    ldr  x0,       [sp, #0]    // x0 = 0 (fork returns 0 in child)
+    ldp  x1,  x2,  [sp, #8]
+    ldp  x3,  x4,  [sp, #24]
+    ldp  x5,  x6,  [sp, #40]
+    ldp  x7,  x8,  [sp, #56]
+    ldp  x9,  x10, [sp, #72]
+    ldp  x11, x12, [sp, #88]
+    ldp  x13, x14, [sp, #104]
+    ldp  x15, x16, [sp, #120]
+    ldp  x17, x18, [sp, #136]
+    ldp  x19, x20, [sp, #152]
+    ldp  x21, x22, [sp, #168]
+    ldp  x23, x24, [sp, #184]
+    ldp  x25, x26, [sp, #200]
+    ldp  x27, x28, [sp, #216]
+    ldp  x29, x30, [sp, #232]
+    add  sp,  sp,  #272
+    eret
+
+// ── arch_execve_return — drop into user space at a new entry point ─────────
+//
+// Called from sched::replace_address_space after the new address space is
+// installed.  Never returns.
+//
+// Arguments (AAPCS64):
+//   x0 = entry   — virtual address of the new process entry point
+//   x1 = user_sp — user stack pointer
+.global arch_execve_return
+.type   arch_execve_return, %function
+arch_execve_return:
+    msr  elr_el1,  x0       // user entry point
+    msr  sp_el0,   x1       // user stack pointer
+    msr  spsr_el1, xzr      // EL0t, all interrupts unmasked
+    dsb  sy
+    isb
+    // Zero all general-purpose registers so the new process starts clean.
+    mov  x0,  xzr
+    mov  x1,  xzr
+    mov  x2,  xzr
+    mov  x3,  xzr
+    mov  x4,  xzr
+    mov  x5,  xzr
+    mov  x6,  xzr
+    mov  x7,  xzr
+    mov  x8,  xzr
+    mov  x9,  xzr
+    mov  x10, xzr
+    mov  x11, xzr
+    mov  x12, xzr
+    mov  x13, xzr
+    mov  x14, xzr
+    mov  x15, xzr
+    mov  x16, xzr
+    mov  x17, xzr
+    mov  x18, xzr
+    mov  x19, xzr
+    mov  x20, xzr
+    mov  x21, xzr
+    mov  x22, xzr
+    mov  x23, xzr
+    mov  x24, xzr
+    mov  x25, xzr
+    mov  x26, xzr
+    mov  x27, xzr
+    mov  x28, xzr
+    mov  x29, xzr
+    mov  x30, xzr
+    eret
 "#);
 
 // ── IRQ dispatch table ────────────────────────────────────────────────────────
@@ -363,18 +526,22 @@ unsafe extern "C" fn exc_unexpected_handler(esr: u64, elr: u64) {
     panic!("unexpected exception: ESR={:#010x} ELR={:#010x}", esr, elr);
 }
 
-/// AArch64 syscall entry — called from `exc_el0_sync` after EC check.
-///
-/// Register mapping on entry: x0=a0, x1=a1, x2=a2, x8=syscall_number.
-/// Calls `syscall_dispatch` (defined in the `kernel` crate as `#[no_mangle]`).
+/// AArch64 syscall entry — legacy wrapper; the asm vector calls `syscall_dispatch`
+/// directly.  Kept for documentation; matches the 8-parameter (+ frame_ptr) signature.
 #[no_mangle]
 pub unsafe extern "C" fn syscall_entry_aarch64(
-    a0: usize, a1: usize, a2: usize, _a3: usize,
-    _a4: usize, _a5: usize, _a6: usize, _a7: usize,
-    number: usize,
+    number:    usize,
+    a0: usize, a1: usize, a2: usize,
+    a3: usize, a4: usize, a5: usize,
+    frame_ptr: usize,
 ) -> isize {
     extern "C" {
-        fn syscall_dispatch(number: usize, a0: usize, a1: usize, a2: usize) -> isize;
+        fn syscall_dispatch(
+            number:    usize,
+            a0: usize, a1: usize, a2: usize,
+            a3: usize, a4: usize, a5: usize,
+            frame_ptr: usize,
+        ) -> isize;
     }
-    syscall_dispatch(number, a0, a1, a2)
+    syscall_dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr)
 }
