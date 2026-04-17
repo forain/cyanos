@@ -74,11 +74,13 @@ pub fn init() {
         // Vector 32 = IRQ0 (8253/8254 timer after PIC remapping).
         IDT.0[32] = IdtEntry::new(timer_irq as *const () as usize, 0x08, 0, 0x8E);
 
+        #[cfg(target_arch = "x86_64")]
         let ptr = IdtPointer {
             limit: (size_of::<Idt>() - 1) as u16,
             base:  core::ptr::addr_of!(IDT) as u64,
         };
-        core::arch::asm!("lidt [{ptr}]", ptr = in(reg) &ptr, options(nostack));
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("lidt [{}]", in(reg) &ptr, options(nostack));
     }
 }
 
