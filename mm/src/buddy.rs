@@ -3,9 +3,20 @@
 //! See: linux/mm/page_alloc.c
 
 use spin::Mutex;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const PAGE_SIZE: usize = 4096;
 pub const MAX_ORDER: usize = 11; // 2^10 pages = 4 MiB max contiguous block.
+
+/// Total pages ever freed into the allocator (proxy for physical RAM size).
+static TOTAL_PAGES: AtomicUsize = AtomicUsize::new(0);
+/// Current free page count (updated on alloc/free).
+static FREE_PAGES:  AtomicUsize = AtomicUsize::new(0);
+
+/// Return total pages registered with the buddy allocator.
+pub fn total_pages() -> usize { TOTAL_PAGES.load(Ordering::Relaxed) }
+/// Return approximate number of free pages.
+pub fn free_pages()  -> usize { FREE_PAGES.load(Ordering::Relaxed) }
 
 /// A free list for one order level.
 struct FreeList {
@@ -50,6 +61,8 @@ pub fn init_from_map(regions: &[boot::MemoryRegion]) {
             addr += PAGE_SIZE << order;
         }
     }
+    // Snapshot total = free pages right after init (before any allocations).
+    TOTAL_PAGES.store(FREE_PAGES.load(Ordering::Relaxed), Ordering::Relaxed);
 }
 
 /// Allocate 2^order contiguous physical pages. Returns physical address or None.
@@ -64,6 +77,7 @@ pub fn alloc(order: usize) -> Option<usize> {
                 let buddy = addr + (PAGE_SIZE << split);
                 lists[split].head = Some(buddy);
             }
+            FREE_PAGES.fetch_sub(1 << order, Ordering::Relaxed);
             return Some(addr);
         }
     }
@@ -73,6 +87,7 @@ pub fn alloc(order: usize) -> Option<usize> {
 /// Free 2^order contiguous pages starting at `addr`.
 pub fn free(addr: usize, order: usize) {
     assert!(order < MAX_ORDER);
+    FREE_PAGES.fetch_add(1 << order, Ordering::Relaxed);
     let mut lists = FREE_LISTS.lock();
     let mut current = addr;
     let mut current_order = order;

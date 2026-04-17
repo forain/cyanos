@@ -17,15 +17,21 @@ use crate::buddy::{PAGE_SIZE, alloc as buddy_alloc, free as buddy_free};
 
 /// Maximum number of individual pages tracked per lazy VMA.
 ///
-/// A lazy VMA may span at most `MAX_LAZY_PAGES` pages.  Attempting to fault in
-/// a page beyond this index is rejected with OOM (returns `false` from
-/// `handle_user_page_fault`), which the kernel treats as a segmentation fault.
-/// This prevents the previous silent leak where pages beyond this limit were
-/// mapped but could never be freed.
-///
-/// To support larger anonymous regions increase this constant; it trades stack
-/// space in each `VmaRegion` (8 bytes × MAX_LAZY_PAGES) for tracking capacity.
-pub const MAX_LAZY_PAGES: usize = 64;
+/// Increased from 64 to 512 to support larger heap/stack regions before the
+/// Phase 6 migration to a slab-allocated linked list.
+pub const MAX_LAZY_PAGES: usize = 512;
+
+// ── POSIX mmap/mprotect protection flags ─────────────────────────────────────
+pub const PROT_NONE:  u32 = 0;
+pub const PROT_READ:  u32 = 1 << 0;
+pub const PROT_WRITE: u32 = 1 << 1;
+pub const PROT_EXEC:  u32 = 1 << 2;
+
+// ── POSIX mmap map flags ──────────────────────────────────────────────────────
+pub const MAP_SHARED:    u32 = 1 << 0;
+pub const MAP_PRIVATE:   u32 = 1 << 1;
+pub const MAP_ANONYMOUS: u32 = 1 << 5;
+pub const MAP_FIXED:     u32 = 1 << 4;
 
 /// Represents a contiguous virtual memory region within an address space.
 #[derive(Clone, Copy)]
@@ -43,12 +49,29 @@ pub struct VmaRegion {
     pub lazy_pages: [usize; MAX_LAZY_PAGES],
     /// Number of entries in `lazy_pages` that have been filled.
     pub lazy_count: usize,
+
+    // ── POSIX fields added in Phase 0 ────────────────────────────────────────
+    /// POSIX protection flags (PROT_READ | PROT_WRITE | PROT_EXEC).
+    pub prot:      u32,
+    /// mmap flags (MAP_SHARED | MAP_PRIVATE | MAP_ANONYMOUS).
+    pub map_flags: u32,
+    /// Capability token for file-backed VMAs (0 = anonymous).
+    pub file_cap:  usize,
+    /// Offset into the backing file (for file-backed VMAs).
+    pub file_off:  u64,
+    /// True if this VMA is a copy-on-write clone; write faults allocate a
+    /// new page and copy the content before remapping writable.
+    pub cow:       bool,
 }
 
 /// Per-process address space.
 pub struct AddressSpace {
     pub page_table_root: usize,
     pub regions: [Option<VmaRegion>; 64],
+    /// Virtual address where the heap begins (set by ELF loader; 0 = no heap).
+    pub heap_start: usize,
+    /// Current heap break (end of heap VMA).
+    pub heap_end: usize,
 }
 
 impl Drop for AddressSpace {
@@ -89,6 +112,8 @@ impl AddressSpace {
         Self {
             page_table_root,
             regions: [None; 64],
+            heap_start: 0,
+            heap_end: 0,
         }
     }
 
@@ -157,6 +182,11 @@ impl AddressSpace {
             lazy: false,
             lazy_pages: [0; MAX_LAZY_PAGES],
             lazy_count: 0,
+            prot:      PROT_READ | PROT_WRITE,
+            map_flags: MAP_ANONYMOUS | MAP_PRIVATE,
+            file_cap:  0,
+            file_off:  0,
+            cow:       false,
         });
         true
     }
@@ -196,6 +226,11 @@ impl AddressSpace {
             lazy: true,
             lazy_pages: [0; MAX_LAZY_PAGES],
             lazy_count: 0,
+            prot:      PROT_READ | PROT_WRITE,
+            map_flags: MAP_ANONYMOUS | MAP_PRIVATE,
+            file_cap:  0,
+            file_off:  0,
+            cow:       false,
         });
         true
     }
@@ -269,47 +304,90 @@ impl AddressSpace {
         true
     }
 
-    /// Unmap `size` bytes starting at `virt` and free the backing pages.
+    /// Unmap a virtual address range `[virt, virt+len)`, freeing any backing pages.
     ///
-    /// The `virt` address must match a VmaRegion start exactly.
-    pub fn unmap(&mut self, virt: usize, size: usize) {
-        if size == 0 { return; }
-        let virt  = virt & !(PAGE_SIZE - 1);
-        let _pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    /// Handles full removal, front-trim, and back-trim for each overlapping VMA.
+    /// Middle splits (where neither end of the unmap aligns with the VMA boundary)
+    /// truncate to the left portion; the right portion is leaked — this is a known
+    /// Phase 6 limitation that Phase 7's VMO refcount migration will resolve.
+    pub fn unmap_range(&mut self, virt: usize, len: usize) {
+        if len == 0 { return; }
+        let virt = virt & !(PAGE_SIZE - 1);
+        let len  = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let end  = match virt.checked_add(len) { Some(e) => e, None => return };
+
+        let pt = self.page_table_root;
+        let mut did_unmap = false;
 
         for slot in self.regions.iter_mut() {
             let region = match slot {
-                Some(r) if r.start == virt => r,
+                Some(r) if r.start < end && r.end > virt => r,
                 _ => continue,
             };
 
-            // Unmap each page and free backing memory.
+            let r_start = region.start;
+            let r_end   = region.end;
+            let clip_s  = virt.max(r_start);
+            let clip_e  = end.min(r_end);
+
+            // ── Free physical pages in the clipped range ──────────────────────
             if region.lazy {
-                // Lazy VMA: free each individually tracked physical page.
-                // Iterate by page count (not lazy_count) since pages may
-                // fault in out of order, leaving gaps in lazy_pages.
-                let max_idx = ((region.end - region.start) / PAGE_SIZE).min(MAX_LAZY_PAGES);
-                for i in 0..max_idx {
+                let pg_first = (clip_s - r_start) / PAGE_SIZE;
+                let pg_last  = (clip_e - r_start + PAGE_SIZE - 1) / PAGE_SIZE;
+                for i in pg_first..pg_last.min(MAX_LAZY_PAGES) {
                     if region.lazy_pages[i] != 0 {
-                        unsafe { unmap_page(self.page_table_root, region.start + i * PAGE_SIZE); }
+                        unsafe { unmap_page(pt, r_start + i * PAGE_SIZE); }
                         buddy_free(region.lazy_pages[i], 0);
+                        region.lazy_pages[i] = 0;
+                        region.lazy_count = region.lazy_count.saturating_sub(1);
                     }
                 }
             } else {
-                // Eager VMA: pages form a single contiguous buddy allocation.
-                let region_pages = (region.end - region.start) / PAGE_SIZE;
-                for i in 0..region_pages {
-                    unsafe { unmap_page(self.page_table_root, region.start + i * PAGE_SIZE); }
+                // Eager VMA: unmap each page in the overlap.
+                let n = (clip_e - clip_s) / PAGE_SIZE;
+                for i in 0..n {
+                    unsafe { unmap_page(pt, clip_s + i * PAGE_SIZE); }
                 }
-                let order = pages_to_order(region_pages);
-                buddy_free(region.phys, order);
             }
 
-            *slot = None;
-            // Flush stale TLB entries on all CPUs after clearing PTEs.
-            tlb_shootdown_all();
-            return;
+            // ── Reshape the VMA ───────────────────────────────────────────────
+            if clip_s == r_start && clip_e == r_end {
+                // Whole VMA removed.
+                if !region.lazy && region.phys != 0 {
+                    buddy_free(region.phys, pages_to_order((r_end - r_start) / PAGE_SIZE));
+                }
+                *slot = None;
+            } else if clip_s == r_start {
+                // Front trim: VMA shrinks to [clip_e, r_end).
+                if region.lazy {
+                    // Shift tracked pages down so index 0 maps to the new start.
+                    let shift = (clip_e - r_start) / PAGE_SIZE;
+                    let total = ((r_end - r_start) / PAGE_SIZE).min(MAX_LAZY_PAGES);
+                    for i in 0..total.saturating_sub(shift) {
+                        region.lazy_pages[i] =
+                            if i + shift < MAX_LAZY_PAGES { region.lazy_pages[i + shift] } else { 0 };
+                    }
+                    for i in total.saturating_sub(shift)..total { region.lazy_pages[i] = 0; }
+                } else if region.phys != 0 {
+                    region.phys += clip_e - r_start;
+                }
+                region.start = clip_e;
+            } else {
+                // Back trim (or middle → leave left part, accept right leak for eager).
+                region.end = clip_s;
+            }
+
+            did_unmap = true;
         }
+
+        if did_unmap { tlb_shootdown_all(); }
+    }
+
+    /// Unmap `size` bytes starting at `virt` and free the backing pages.
+    ///
+    /// Delegates to [`unmap_range`]; kept for compatibility with existing call sites.
+    pub fn unmap(&mut self, virt: usize, size: usize) {
+        self.unmap_range(virt, size);
     }
 
     /// Look up the VmaRegion that contains `virt`, if any.
@@ -317,6 +395,169 @@ impl AddressSpace {
         self.regions.iter()
             .filter_map(|r| r.as_ref())
             .find(|r| virt >= r.start && virt < r.end)
+    }
+
+    /// Translate a user virtual address to the physical address of its backing byte.
+    ///
+    /// For eager VMAs the backing memory is contiguous: `phys = vma.phys + (virt - vma.start)`.
+    /// For lazy VMAs each faulted-in page is stored separately in `lazy_pages[]`.
+    ///
+    /// Returns `None` if:
+    /// - no VMA covers `virt`,
+    /// - the containing VMA is lazy and the page hasn't been faulted in yet, or
+    /// - the page index overflows `MAX_LAZY_PAGES`.
+    pub fn virt_to_phys(&self, virt: usize) -> Option<usize> {
+        let vma = self.find(virt)?;
+        if vma.lazy {
+            let offset     = virt - vma.start;
+            let page_index = offset / PAGE_SIZE;
+            let page_off   = offset % PAGE_SIZE;
+            if page_index >= MAX_LAZY_PAGES { return None; }
+            let phys_page  = vma.lazy_pages[page_index];
+            if phys_page == 0 { return None; } // not yet faulted in
+            Some(phys_page + page_off)
+        } else {
+            Some(vma.phys + (virt - vma.start))
+        }
+    }
+
+    /// Change protection flags on `[addr, addr+len)`.
+    ///
+    /// Translates POSIX `prot` flags to `PageFlags` and remaps every already-
+    /// faulted page in the affected VMAs.  W^X is enforced: PROT_WRITE and
+    /// PROT_EXEC together return `false`.
+    ///
+    /// Returns `true` on success, `false` if the range is invalid or W^X
+    /// would be violated.
+    pub fn mprotect(&mut self, addr: usize, len: usize, prot: u32) -> bool {
+        if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 { return false; }
+
+        let addr = addr & !(PAGE_SIZE - 1);
+        let end  = match addr.checked_add((len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)) {
+            Some(e) => e,
+            None    => return false,
+        };
+
+        // Build the new PageFlags from the POSIX prot bits.
+        let mut new_flags = PageFlags::PRESENT | PageFlags::USER;
+        if prot & PROT_WRITE != 0 { new_flags |= PageFlags::WRITABLE; }
+        if prot & PROT_EXEC  != 0 { new_flags |= PageFlags::EXECUTE; }
+
+        let mut changed = false;
+        for slot in self.regions.iter_mut() {
+            let region = match slot.as_mut() {
+                Some(r) if r.start < end && r.end > addr => r,
+                _ => continue,
+            };
+
+            region.prot  = prot;
+            region.flags = new_flags;
+
+            // Remap pages that are already backed (lazy pages that have been faulted in).
+            if region.lazy {
+                let max_idx = ((region.end - region.start) / PAGE_SIZE).min(MAX_LAZY_PAGES);
+                for i in 0..max_idx {
+                    if region.lazy_pages[i] != 0 {
+                        let page_va = region.start + i * PAGE_SIZE;
+                        if page_va >= addr && page_va < end {
+                            unsafe { map_page(self.page_table_root, page_va, region.lazy_pages[i], new_flags); }
+                        }
+                    }
+                }
+            } else if region.phys != 0 {
+                let n_pages = (region.end - region.start) / PAGE_SIZE;
+                for i in 0..n_pages {
+                    let page_va = region.start + i * PAGE_SIZE;
+                    if page_va >= addr && page_va < end {
+                        unsafe { map_page(self.page_table_root, page_va, region.phys + i * PAGE_SIZE, new_flags); }
+                    }
+                }
+            }
+            changed = true;
+        }
+
+        if changed { tlb_shootdown_all(); }
+        changed
+    }
+
+    /// Adjust the heap break (program break) for this address space.
+    ///
+    /// The heap VMA is identified as the one starting at `self.heap_start`
+    /// (set by the ELF loader in Phase 1; zero for kernel tasks).
+    ///
+    /// Follows Linux `brk(2)` semantics:
+    ///   - `new_end == 0` → query: return the current break without modifying anything.
+    ///   - Success        → return the new break.
+    ///   - Failure (OOM, overlap) → return the **current** break unchanged.
+    ///     (musl detects failure by comparing the return value to the requested value,
+    ///     NOT by checking for a negative return.)
+    pub fn brk(&mut self, new_end: usize) -> isize {
+        let current_break = if self.heap_end != 0 { self.heap_end } else { self.heap_start };
+
+        // Query: return the current break without any modification.
+        if new_end == 0 { return current_break as isize; }
+
+        if self.heap_start == 0 { return current_break as isize; } // kernel task, no heap
+        let new_end = (new_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        // Find the heap VMA (lazily created on first brk call after execve).
+        let idx = match self.regions.iter().position(|r| {
+            r.as_ref().map(|r| r.start == self.heap_start).unwrap_or(false)
+        }) {
+            Some(i) => i,
+            None    => {
+                // No heap VMA yet — create one on the first upward brk call.
+                if new_end <= self.heap_start { return current_break as isize; }
+                let flags = PageFlags::PRESENT | PageFlags::USER | PageFlags::WRITABLE;
+                if self.map_lazy(self.heap_start, new_end - self.heap_start, flags) {
+                    self.heap_end = new_end;
+                    return new_end as isize;
+                }
+                return current_break as isize; // OOM: return unchanged break
+            }
+        };
+
+        let region = self.regions[idx].as_mut().unwrap();
+        if new_end == region.end {
+            return new_end as isize; // no-op
+        }
+
+        if new_end > region.end {
+            // Grow: check for overlap with other VMAs first.
+            let old_end = region.end;
+            for (i, slot) in self.regions.iter().enumerate() {
+                if i == idx { continue; }
+                if let Some(r) = slot {
+                    if r.start < new_end && r.end > old_end {
+                        return current_break as isize; // overlap: return unchanged
+                    }
+                }
+            }
+            self.regions[idx].as_mut().unwrap().end = new_end;
+        } else {
+            // Shrink: unmap and free pages from new_end to old_end.
+            let region = self.regions[idx].as_mut().unwrap();
+            let heap_start = region.start; // = self.heap_start
+            let old_end    = region.end;
+            region.end     = new_end;
+
+            // Page indices are relative to the VMA start (heap_start).
+            let first_idx = (new_end - heap_start) / PAGE_SIZE;
+            let last_idx  = (old_end  - heap_start + PAGE_SIZE - 1) / PAGE_SIZE;
+            for i in first_idx..last_idx.min(MAX_LAZY_PAGES) {
+                if region.lazy_pages[i] != 0 {
+                    let page_va = heap_start + i * PAGE_SIZE;
+                    unsafe { unmap_page(self.page_table_root, page_va); }
+                    buddy_free(region.lazy_pages[i], 0);
+                    region.lazy_pages[i] = 0;
+                    region.lazy_count = region.lazy_count.saturating_sub(1);
+                }
+            }
+            tlb_shootdown_all();
+        }
+
+        self.heap_end = new_end;
+        new_end as isize
     }
 }
 

@@ -9,6 +9,7 @@
 #![no_std]
 
 pub mod buddy;
+pub mod cow;
 pub mod paging;
 pub mod slab;
 pub mod vmm;
