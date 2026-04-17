@@ -116,10 +116,12 @@ pub fn init() {
         let tss_limit = (size_of::<Tss>() - 1) as u32;
         GDT.tss = TssDescriptor::new(tss_base, tss_limit);
 
+        #[cfg(target_arch = "x86_64")]
         let ptr = GdtPointer {
             limit: (size_of::<Gdt>() - 1) as u16,
             base:  core::ptr::addr_of!(GDT) as u64,
         };
+        #[cfg(target_arch = "x86_64")]
         core::arch::asm!(
             "lgdt [{ptr}]",
             // Reload CS via a far return.
