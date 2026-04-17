@@ -28,7 +28,7 @@ runner = [
     "-kernel",
 ]
 rustflags = [
-    "-C", "linker=ld.lld",
+    "-C", "linker=rust-lld",
     "-C", "relocation-model=static",
     "-C", "code-model=small",       # AArch64 only accepts small/tiny/large
 ]
@@ -41,7 +41,7 @@ rustflags = [
 [target.x86_64-unknown-none]
 runner = "scripts/run-x86_64.sh"
 rustflags = [
-    "-C", "linker=ld.lld",
+    "-C", "linker=rust-lld",
     "-C", "relocation-model=static",
     "-C", "code-model=kernel",
 ]
