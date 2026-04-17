@@ -1,0 +1,19 @@
+# Userland build configuration.
+#
+# cargo check --target aarch64-linux-android   (type-check, no linking)
+# cargo build --target aarch64-linux-android   (build staticlib / binary)
+#
+# For production static ELFs, use scripts/build-userland.sh which passes
+# -nostartfiles -static to the linker so Android bionic is not pulled in.
+
+[build]
+target = "aarch64-linux-android"
+
+[target.aarch64-linux-android]
+rustflags = [
+    # Keep compiler builtins (div, memcpy intrinsics from compiler-rt).
+    # -nostartfiles suppresses crt1.o/crti.o so our _start is used.
+    # -static avoids any dynamic linking.
+    "-C", "link-arg=-nostartfiles",
+    "-C", "link-arg=-static",
+]
