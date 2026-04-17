@@ -88,6 +88,38 @@ unsafe fn early_serial_init() {
     }
 }
 
+/// Non-blocking serial RX poll.  Returns `Some(byte)` if a character is
+/// waiting in the UART RX FIFO, or `None` if the FIFO is empty.
+///
+/// AArch64 (PL011): FR bit 4 = RXFE (RX FIFO empty); read from DR.
+/// x86-64 (16550):  LSR bit 0 = DR (Data Ready);       read from RHR (0x3F8).
+pub fn serial_read_byte() -> Option<u8> {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::asm;
+        let mut status: u8;
+        asm!("in al, dx", out("al") status, in("dx") 0x3FDu16, options(nomem, nostack));
+        if status & 0x01 != 0 {
+            let mut b: u8;
+            asm!("in al, dx", out("al") b, in("dx") 0x3F8u16, options(nomem, nostack));
+            return Some(b);
+        }
+        return None;
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        #[cfg(not(feature = "rpi5"))]
+        let base = 0x09000000usize;
+        #[cfg(feature = "rpi5")]
+        let base = 0x107D_0010_00usize;
+        let fr = (base + 0x18) as *const u32;
+        // bit 4 = RXFE (RX FIFO empty); if set there is no data
+        if fr.read_volatile() & (1 << 4) != 0 { return None; }
+        let dr = base as *const u32;
+        Some((dr.read_volatile() & 0xFF) as u8)
+    }
+}
+
 unsafe fn serial_write_byte(b: u8) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -122,6 +154,12 @@ pub fn serial_print(s: &str) {
         unsafe { serial_write_byte(b); }
         if b == b'\n' { unsafe { serial_write_byte(b'\r'); } }
     }
+}
+
+/// Write raw bytes to serial without any LF→CRLF translation.
+/// Used by `sys_write` for stdout/stderr (fd 1/2).
+pub fn serial_write_raw(buf: &[u8]) {
+    for &b in buf { unsafe { serial_write_byte(b); } }
 }
 
 // Simple hex formatter for panic messages — no alloc needed.

@@ -9,11 +9,16 @@ edition.workspace = true
 rpi5 = ["arch-aarch64/rpi5"]
 
 [dependencies]
-mm      = { path = "../mm" }
-sched   = { path = "../sched" }
-ipc     = { path = "../ipc" }
-boot    = { path = "../boot" }
-drivers = { path = "../drivers" }
+mm         = { path = "../mm" }
+sched      = { path = "../sched" }
+elf        = { path = "../elf" }
+ipc        = { path = "../ipc" }
+boot       = { path = "../boot" }
+drivers    = { path = "../drivers" }
+vfs-server  = { path = "../servers/vfs" }
+net-server  = { path = "../servers/net" }
+tty-server  = { path = "../servers/tty" }
+init-server = { path = "../servers/init" }
 usb     = { path = "../drivers/usb" }
 wifi    = { path = "../drivers/wifi" }
 cyanos-lib = { path = "../lib" }
