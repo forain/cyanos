@@ -8,8 +8,11 @@
 
 #![no_std]
 
+pub mod clone;
 pub mod context;
+pub mod futex;
 pub mod runqueue;
+pub mod signal;
 pub mod task;
 
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
@@ -291,6 +294,25 @@ pub fn exit(code: i32) -> ! {
     unsafe {
         let id  = cpu_id();
         let pid = CURRENT_PID[id];
+
+        // POSIX pthread_join support: if clear_child_tid is set, atomically
+        // write 0 to that address and wake any futex waiters (the joiner).
+        let ctid_info: Option<(usize, usize)> = {
+            let rq = RUN_QUEUE.lock();
+            rq.find_pid(pid)
+                .and_then(|idx| rq.get(idx))
+                .and_then(|t| {
+                    let ctid = t.clear_child_tid;
+                    if ctid == 0 { return None; }
+                    let phys = t.address_space.as_ref()?.virt_to_phys(ctid)?;
+                    Some((ctid, phys))
+                })
+        };
+        if let Some((ctid_virt, ctid_phys)) = ctid_info {
+            core::ptr::write(ctid_phys as *mut u32, 0);
+            futex::futex_wake(ctid_virt, u32::MAX);
+        }
+
         {
             let mut rq = RUN_QUEUE.lock();
             if let Some(idx) = rq.find_pid(pid) {
@@ -563,6 +585,410 @@ pub fn ap_entry() -> ! {
 /// Backward-compatible alias used by the syscall dispatch table.
 #[inline]
 pub fn r#yield() { yield_now(); }
+
+// ── Signal API ───────────────────────────────────────────────────────────────
+
+/// Deliver pending signals to the current task at a return-to-user-space path.
+///
+/// `frame_ptr` — address of the `UserFrame` saved on the kernel stack by the
+/// EL0→EL1 exception entry stub (AArch64 only; 0 on x86-64).
+///
+/// This function is called with `#[no_mangle]` from `signal::check_and_deliver_signals`
+/// so that the AArch64 exception assembly can branch to it directly by symbol.
+pub fn check_and_deliver_signals(frame_ptr: usize) {
+    signal::check_and_deliver_signals(frame_ptr);
+}
+
+/// Restore the user context from a saved `rt_sigframe` (called by `sys_rt_sigreturn`).
+pub fn restore_signal_frame(frame_ptr: usize) {
+    signal::restore_signal_frame(frame_ptr);
+}
+
+// ── Signal action/mask API ────────────────────────────────────────────────────
+
+/// Install or query a signal action for the current task.
+///
+/// `act_ptr`    — pointer to a new `SigAction` (0 = query only).
+/// `oldact_ptr` — pointer to write the previous `SigAction` (0 = discard).
+pub fn sys_sigaction(signum: u32, act_ptr: usize, oldact_ptr: usize) -> isize {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return -1; }
+        let mut rq = RUN_QUEUE.lock();
+        let idx = match rq.find_pid(pid) { Some(i) => i, None => return -3 };
+        let task = match rq.get_mut(idx) { Some(t) => t, None => return -3 };
+
+        if oldact_ptr != 0 {
+            core::ptr::write(oldact_ptr as *mut task::SigAction,
+                task.signal_actions[signum as usize]);
+        }
+        if act_ptr != 0 {
+            let new_act = core::ptr::read(act_ptr as *const task::SigAction);
+            task.signal_actions[signum as usize] = new_act;
+        }
+    }
+    0
+}
+
+/// Set or query the signal mask for the current task.
+///
+/// `how`: 0 = SIG_BLOCK, 1 = SIG_UNBLOCK, 2 = SIG_SETMASK.
+pub fn sys_sigprocmask(how: usize, set_ptr: usize, oldset_ptr: usize) -> isize {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return -1; }
+        let mut rq = RUN_QUEUE.lock();
+        let idx = match rq.find_pid(pid) { Some(i) => i, None => return -3 };
+        let task = match rq.get_mut(idx) { Some(t) => t, None => return -3 };
+
+        if oldset_ptr != 0 {
+            core::ptr::write(oldset_ptr as *mut u64, task.signal_mask);
+        }
+        if set_ptr != 0 {
+            let set = core::ptr::read(set_ptr as *const u64);
+            task.signal_mask = match how {
+                0 => task.signal_mask | set,   // SIG_BLOCK
+                1 => task.signal_mask & !set,  // SIG_UNBLOCK
+                2 => set,                      // SIG_SETMASK
+                _ => return -22,               // EINVAL
+            };
+        }
+    }
+    0
+}
+
+/// Set the pending signal bit for `target_pid`.
+///
+/// Returns 0 on success, -3 (ESRCH) if the task does not exist.
+pub fn deliver_signal(target_pid: task::Pid, sig: u32) -> isize {
+    if sig == 0 { return 0; } // signal 0 = existence check
+    let mut rq = RUN_QUEUE.lock();
+    let idx = match rq.find_pid(target_pid) { Some(i) => i, None => return -3 };
+    if let Some(t) = rq.get_mut(idx) {
+        if sig < 64 { t.signal_pending |= 1u64 << sig; }
+        // If the task is blocked, unblock it so it can handle the signal.
+        if t.state == task::TaskState::Blocked {
+            t.state = task::TaskState::Ready;
+        }
+    }
+    0
+}
+
+/// Return the signal_pending bitmask for the current task.
+pub fn pending_signals() -> u64 {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return 0; }
+        let rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get(idx) { return t.signal_pending; }
+        }
+        0
+    }
+}
+
+/// Atomically replace the current task's signal mask.  Returns the old mask.
+pub fn replace_signal_mask(new_mask: u64) -> u64 {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return 0; }
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get_mut(idx) {
+                let old = t.signal_mask;
+                t.signal_mask = new_mask;
+                return old;
+            }
+        }
+        0
+    }
+}
+
+/// Clear a single pending signal from the current task (used by rt_sigtimedwait).
+pub fn clear_pending_signal(signo: u32) {
+    if signo == 0 || signo > 64 { return; }
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return; }
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get_mut(idx) {
+                t.signal_pending &= !(1u64 << (signo - 1));
+            }
+        }
+    }
+}
+
+/// Return the parent PID of the current task.
+pub fn current_ppid() -> task::Pid {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return 0; }
+        let rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get(idx) { return t.ppid; }
+        }
+        0
+    }
+}
+
+/// Copy the current task's working directory into `buf[..size]`.
+/// Returns the length written (not including NUL), or -1 on error.
+pub fn current_cwd(buf: *mut u8, size: usize) -> isize {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return -1; }
+        let rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get(idx) {
+                let len = t.cwd_len.min(size.saturating_sub(1));
+                core::ptr::copy_nonoverlapping(t.cwd.as_ptr(), buf, len);
+                *buf.add(len) = 0;
+                return len as isize;
+            }
+        }
+        -1
+    }
+}
+
+/// Set the current task's working directory.  `path` must be absolute.
+pub fn set_cwd(path: &[u8]) -> bool {
+    if path.is_empty() || path.len() > 255 { return false; }
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return false; }
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get_mut(idx) {
+                let len = path.len().min(255);
+                t.cwd[..len].copy_from_slice(&path[..len]);
+                t.cwd[len] = 0;
+                t.cwd_len  = len;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Return the current task's umask; optionally set a new one.
+/// Pass `new_mask = u32::MAX` to query without modifying.
+pub fn umask(new_mask: u32) -> u32 {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return 0o022; }
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get_mut(idx) {
+                let old = t.umask;
+                if new_mask != u32::MAX { t.umask = new_mask & 0o777; }
+                return old;
+            }
+        }
+        0o022
+    }
+}
+
+/// Return the process group ID of the current task.
+pub fn current_pgid() -> task::Pid {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return 0; }
+        let rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get(idx) { return t.pgid; }
+        }
+        0
+    }
+}
+
+/// Set the process group ID of task `pid` to `pgid`.
+pub fn set_pgid(pid: task::Pid, pgid: task::Pid) -> bool {
+    let mut rq = RUN_QUEUE.lock();
+    if let Some(idx) = rq.find_pid(pid) {
+        if let Some(t) = rq.get_mut(idx) { t.pgid = pgid; return true; }
+    }
+    false
+}
+
+/// Create a new session for the current task.  Returns the new SID.
+pub fn setsid() -> task::Pid {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return 0; }
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get_mut(idx) {
+                t.sid  = pid;
+                t.pgid = pid;
+                return pid;
+            }
+        }
+        0
+    }
+}
+
+/// Return the current task's heap end (program break), or 0 if not set.
+pub fn heap_end() -> isize {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return 0; }
+        let rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get(idx) { return t.heap_end as isize; }
+        }
+        0
+    }
+}
+
+/// Return the session ID of the current task.
+pub fn current_sid() -> task::Pid {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return 0; }
+        let rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get(idx) { return t.sid; }
+        }
+        0
+    }
+}
+
+// ── Thread / futex API ────────────────────────────────────────────────────────
+
+/// Record the `clear_child_tid` address for the current task (for `set_tid_address`).
+pub fn set_clear_child_tid(tidptr: usize) {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return; }
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get_mut(idx) { t.clear_child_tid = tidptr; }
+        }
+    }
+}
+
+// ── TLS register helpers (x86-64 FS.base) ────────────────────────────────────
+
+/// Store the new FS.base in the current task's CpuContext so it is
+/// restored on the next context switch back to this task.
+pub fn set_fs_base(base: u64) {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return; }
+        let mut rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get_mut(idx) {
+                #[cfg(not(target_arch = "aarch64"))]
+                { t.ctx.fs_base = base; }
+                #[cfg(target_arch = "aarch64")]
+                { t.ctx.tpidr_el0 = base; }
+                t.tls_base = base;
+            }
+        }
+    }
+}
+
+/// Read the FS.base saved in the current task's CpuContext.
+pub fn get_fs_base() -> u64 {
+    unsafe {
+        let pid = CURRENT_PID[cpu_id()];
+        if pid == 0 { return 0; }
+        let rq = RUN_QUEUE.lock();
+        if let Some(idx) = rq.find_pid(pid) {
+            if let Some(t) = rq.get(idx) {
+                return t.tls_base;
+            }
+        }
+        0
+    }
+}
+
+// ── Arch-provided: jump to user space at a new entry point ───────────────────
+extern "C" {
+    fn arch_execve_return(entry: usize, user_sp: usize) -> !;
+}
+
+/// Replace the current task's address space with `new_as` and transfer
+/// execution to `entry` / `user_sp` in the new address space.
+///
+/// 1. Switches the hardware page table to `pt_root` (the new AS's root).
+/// 2. Stores `new_as` in the task, dropping (and freeing) the old AS.
+/// 3. Calls `arch_execve_return(entry, user_sp)` — never returns.
+///
+/// # Safety
+///
+/// `new_as` must be fully constructed (all PT_LOAD segments mapped, user stack
+/// mapped) before calling this function.  `pt_root` must be the page-table
+/// root stored inside `new_as`.
+pub fn replace_address_space(
+    new_as:     mm::vmm::AddressSpace,
+    pt_root:    usize,
+    heap_start: usize,
+    entry:      usize,
+    user_sp:    usize,
+) -> ! {
+    unsafe {
+        let id  = cpu_id();
+        let pid = CURRENT_PID[id];
+
+        // Switch the hardware page table BEFORE dropping the old one so that
+        // the CPU is never executing with a freed page-table root.
+        arch_set_page_table(pt_root);
+
+        // Replace the address space.  Assigning Some(new_as) drops the old
+        // AddressSpace, which unmaps all VMAs, frees physical pages, frees
+        // the old PT root, and issues a TLB shootdown.
+        {
+            let mut rq = RUN_QUEUE.lock();
+            if let Some(idx) = rq.find_pid(pid) {
+                if let Some(t) = rq.get_mut(idx) {
+                    t.address_space = Some(new_as);
+                    t.page_table    = pt_root;
+                    t.heap_start    = heap_start;
+                    t.heap_end      = heap_start;
+                }
+            }
+        }
+
+        // Jump to user space.  Does not return.
+        arch_execve_return(entry, user_sp);
+    }
+}
+
+/// Fork the currently-running task.
+///
+/// Thin public wrapper around [`clone::fork_current`].  The `frame_ptr`
+/// argument is the kernel-stack address of the `UserFrame` saved by the
+/// AArch64 EL0 exception stub (0 on x86-64).
+///
+/// Returns the child PID to the parent on success, or a negative errno.
+pub fn fork_current(frame_ptr: usize) -> isize {
+    clone::fork_current(frame_ptr)
+}
+
+/// Spawn a new thread sharing the current process's virtual address space.
+///
+/// Thin public wrapper around [`clone::clone_thread`].
+pub fn clone_thread(
+    flags:       usize,
+    child_stack: usize,
+    tls:         usize,
+    ctid:        usize,
+    frame_ptr:   usize,
+) -> isize {
+    clone::clone_thread(flags, child_stack, tls, ctid, frame_ptr)
+}
+
+/// Block the current task on `uaddr` (FUTEX_WAIT path).
+pub fn futex_wait(uaddr: usize, timeout_ptr: usize) -> isize {
+    futex::futex_wait(uaddr, timeout_ptr)
+}
+
+/// Wake up to `n` tasks blocked on `uaddr` (FUTEX_WAKE path).
+pub fn futex_wake(uaddr: usize, n: u32) -> u32 {
+    futex::futex_wake(uaddr, n)
+}
 
 /// Allocate the next available PID.
 ///
