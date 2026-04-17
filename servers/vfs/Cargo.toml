@@ -1,0 +1,10 @@
+[package]
+name = "vfs-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ipc        = { path = "../../ipc" }
+sched      = { path = "../../sched" }
+mm         = { path = "../../mm" }
+spin.workspace = true

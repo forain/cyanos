@@ -1,0 +1,9 @@
+[package]
+name = "net-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ipc   = { path = "../../ipc" }
+sched = { path = "../../sched" }
+spin.workspace = true
