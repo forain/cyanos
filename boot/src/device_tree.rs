@@ -311,3 +311,25 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
     }
     info
 }
+
+/// Create a minimal default BootInfo for QEMU virt machine when no DTB is provided.
+/// This is used when the kernel is loaded directly with `qemu -kernel`.
+pub fn create_qemu_virt_default() -> BootInfo {
+    // Use a static array that's always initialized
+    static DEFAULT_MM: [MemoryRegion; 1] = [
+        MemoryRegion { base: 0x40000000, length: 0x10000000, kind: MemoryType::Available }, // 256MB at 1GB
+    ];
+
+    let ptr = DEFAULT_MM.as_ptr();
+
+    BootInfo {
+        memory_map: ptr,
+        memory_map_len: 1,
+        framebuffer_base: 0,
+        framebuffer_width: 0,
+        framebuffer_height: 0,
+        framebuffer_pitch: 0,
+        rsdp_addr: 0,
+        uart_base: 0x09000000, // QEMU virt PL011 UART
+    }
+}
