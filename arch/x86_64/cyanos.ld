@@ -77,9 +77,9 @@ SECTIONS
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
-        /* Kernel stack: 64 KiB, 16-byte aligned */
+        /* Kernel stack: 1 MiB, 16-byte aligned (increased for large Task struct operations) */
         . = ALIGN(16);
-        . += 0x10000;
+        . += 0x100000;
         __stack_top = .;
         . = ALIGN(8);
         __bss_end = .;

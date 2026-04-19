@@ -41,10 +41,10 @@ SECTIONS
         *(.data .data.*)
     }
 
-    /* ── 64 KiB kernel stack (in BSS so it does not bloat the ELF) ───────── */
+    /* ── 1 MiB kernel stack (increased for large Task struct operations) ─── */
     .stack : ALIGN(16) {
         __stack_bottom = .;
-        . += 0x10000;           /* 64 KiB */
+        . += 0x100000;          /* 1 MiB (increased from 128 KiB for 267KB Task) */
         __stack_top = .;
     }
 
