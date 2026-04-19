@@ -17,9 +17,9 @@ use crate::buddy::{PAGE_SIZE, alloc as buddy_alloc, free as buddy_free};
 
 /// Maximum number of individual pages tracked per lazy VMA.
 ///
-/// Increased from 64 to 512 to support larger heap/stack regions before the
-/// Phase 6 migration to a slab-allocated linked list.
-pub const MAX_LAZY_PAGES: usize = 512;
+/// Reduced to 64 to keep Task struct small enough for stack operations.
+/// Phase 6 will migrate to a slab-allocated linked list for larger regions.
+pub const MAX_LAZY_PAGES: usize = 64;
 
 // ── POSIX mmap/mprotect protection flags ─────────────────────────────────────
 pub const PROT_NONE:  u32 = 0;
@@ -67,7 +67,7 @@ pub struct VmaRegion {
 /// Per-process address space.
 pub struct AddressSpace {
     pub page_table_root: usize,
-    pub regions: [Option<VmaRegion>; 64],
+    pub regions: [Option<VmaRegion>; 4],  // Reduced from 64 to 4 for smaller Task struct
     /// Virtual address where the heap begins (set by ELF loader; 0 = no heap).
     pub heap_start: usize,
     /// Current heap break (end of heap VMA).
@@ -111,7 +111,7 @@ impl AddressSpace {
     pub fn new(page_table_root: usize) -> Self {
         Self {
             page_table_root,
-            regions: [None; 64],
+            regions: [None; 4],
             heap_start: 0,
             heap_end: 0,
         }
@@ -491,6 +491,11 @@ impl AddressSpace {
     ///   - Failure (OOM, overlap) → return the **current** break unchanged.
     ///     (musl detects failure by comparing the return value to the requested value,
     ///     NOT by checking for a negative return.)
+    /// Return the page table root physical address.
+    pub fn root(&self) -> usize {
+        self.page_table_root
+    }
+
     pub fn brk(&mut self, new_end: usize) -> isize {
         let current_break = if self.heap_end != 0 { self.heap_end } else { self.heap_start };
 
