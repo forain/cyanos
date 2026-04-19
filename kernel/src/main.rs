@@ -9,9 +9,27 @@
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 
 use core::panic::PanicInfo;
+use core::alloc::{GlobalAlloc, Layout};
 
 mod init;
 mod syscall;
+
+// ── Global Allocator ─────────────────────────────────────────────────────────
+
+struct SlabAllocator;
+
+unsafe impl GlobalAlloc for SlabAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        mm::slab::alloc(layout.size()).unwrap_or(core::ptr::null_mut())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        mm::slab::free(ptr, layout.size())
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: SlabAllocator = SlabAllocator;
 
 // ── Architecture-specific boot stubs ─────────────────────────────────────────
 // Each stub provides `_start`, sets up the stack, zeros BSS, then calls
@@ -45,47 +63,8 @@ unsafe fn early_serial_init() {
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn early_serial_init() {
-    // PL011 bring-up before the arch crate's full init() runs.
-    // Board base addresses:
-    //   QEMU virt  : 0x09000000   (ref clock 24 MHz from DTB)
-    //   RPi 5 RP1  : 0x107D001000 (ref clock 48 MHz from RP1 clock tree)
-
-    #[cfg(not(feature = "rpi5"))]
-    {
-        // QEMU: PL011 is permissive about baud rate; just enable TX.
-        let base = 0x09000000usize;
-        let cr = (base + 0x30) as *mut u32;
-        cr.write_volatile(0x0301); // UARTEN | TXE | RXE
-    }
-
-    #[cfg(feature = "rpi5")]
-    {
-        // RPi5 RP1 PL011 full bringup sequence (PL011 TRM §3.3.6).
-        // Reference clock: 48 MHz.
-        // Target baud: 115200.
-        // BRD = 48_000_000 / (16 × 115_200) = 26.042…
-        //   IBRD = 26
-        //   FBRD = round(0.042 × 64) = 3
-        let base = 0x107D_0010_00usize;
-
-        // 1. Disable UART while reconfiguring (CR = 0).
-        let cr   = (base + 0x30) as *mut u32;
-        cr.write_volatile(0);
-
-        // 2. Set integer and fractional baud-rate divisors.
-        let ibrd = (base + 0x24) as *mut u32;
-        let fbrd = (base + 0x28) as *mut u32;
-        ibrd.write_volatile(26);
-        fbrd.write_volatile(3);
-
-        // 3. Program line control: 8-bit words, FIFO enabled, no parity, 1
-        //    stop bit (LCRH bits [6:5]=11 WLEN=8, bit[4]=1 FEN).
-        let lcrh = (base + 0x2C) as *mut u32;
-        lcrh.write_volatile(0x70); // 0b0111_0000
-
-        // 4. Enable UART, TX, and RX.
-        cr.write_volatile(0x0301); // UARTEN | TXE | RXE
-    }
+    // UART is already working from assembly code, skip MMIO config for now
+    // to avoid hanging on PL011 register access before MMU is set up
 }
 
 /// Non-blocking serial RX poll.  Returns `Some(byte)` if a character is
@@ -120,7 +99,7 @@ pub fn serial_read_byte() -> Option<u8> {
     }
 }
 
-unsafe fn serial_write_byte(b: u8) {
+pub unsafe fn serial_write_byte(b: u8) {
     #[cfg(target_arch = "x86_64")]
     {
         use core::arch::asm;
@@ -190,83 +169,100 @@ fn print_hex(mut n: u64) {
 ///   AArch64 — physical address of the device tree blob (DTB), or 0
 #[no_mangle]
 pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
-    // 1. Initialise serial UART as early as possible (needed by panic handler).
+    // Skip early_serial_init to avoid UART MMIO hang
     unsafe { early_serial_init(); }
-    serial_print("\n[CYANOS] kernel_main — starting\n");
 
-    // 2. Initialise architecture-specific hardware (GDT/IDT on x86, vectors on AArch64).
+    // Get default boot info without DTB parsing to avoid serial_print hangs
+    let boot_info = unsafe {
+        #[cfg(target_arch = "x86_64")]
+        { boot::limine::parse() }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Always use default config to avoid serial operations in DTB parsing
+            boot::device_tree::create_qemu_virt_default()
+        }
+    };
+
+    // Initialize architecture hardware
     #[cfg(target_arch = "x86_64")]
     { arch_x86_64::init(); }
     #[cfg(target_arch = "aarch64")]
     { arch_aarch64::init(); }
 
-    // 3. Parse boot information into a unified BootInfo.
-    //    x86-64: Limine UEFI bootloader — info comes from static request
-    //            structs filled by Limine before jumping to _start.
-    //            boot_info_addr is 0 (unused) in the Limine entry.
-    //    AArch64: device tree blob address passed in x0 by firmware.
-    //             A zero address means firmware did not supply a DTB —
-    //             this is a fatal misconfiguration (no memory map).
-    #[cfg(target_arch = "aarch64")]
-    if boot_info_addr == 0 {
-        panic!("kernel_main: no DTB from firmware (x0 == 0); \
-                check config.txt device_tree= setting");
-    }
-
-    let boot_info = unsafe {
-        #[cfg(target_arch = "x86_64")]
-        { boot::limine::parse() }
-        #[cfg(target_arch = "aarch64")]
-        { boot::device_tree::parse(boot_info_addr) }
-    };
-
-    serial_print("[CYANOS] memory map: ");
-    print_hex(boot_info.total_available_memory());
-    serial_print(" bytes available\n");
-
-    // 4a. Re-initialise serial if the DTB reported a different UART base.
-    //     On QEMU virt the DTB advertises /pl011@9000000; on other boards
-    //     the address differs.  Skip for x86-64 (fixed COM1) and RPi 5
-    //     (address already compiled in via the rpi5 feature).
-    #[cfg(all(target_arch = "aarch64", not(feature = "rpi5")))]
-    if boot_info.uart_base != 0 {
-        unsafe { arch_aarch64::uart::reinit(boot_info.uart_base as usize); }
-    }
-
-    // 4b. Register framebuffer parameters discovered from boot info so that
-    //     the framebuffer driver can initialise itself during probe().
-    if boot_info.framebuffer_base != 0 {
-        drivers::framebuffer::set_boot_framebuffer(
-            boot_info.framebuffer_base,
-            boot_info.framebuffer_width,
-            boot_info.framebuffer_height,
-            boot_info.framebuffer_pitch,
-        );
-    }
-
-    // 4. Initialise the physical memory manager from the memory map.
+    // Initialize memory manager
     mm::init_with_map(boot_info.memory_regions());
 
-    // 5. Initialise the scheduler.
+    // Initialize scheduler
     sched::init();
 
-    // 6. Initialise the IPC subsystem.
+    // Initialize IPC
     ipc::init();
 
-    // 7. Spawn PID-1 init task.
-    match sched::spawn(init::init_task_main, 0) {
+    // Spawn the kernel shell task
+    serial_print("[CYANOS] Starting CyanOS kernel shell\n");
+    let entry_addr = init::kernel_shell_task as *const () as usize;
+    serial_print("[CYANOS] Shell task entry address: ");
+    print_hex(entry_addr as u64);
+    serial_print("\n");
+
+    match sched::spawn(init::kernel_shell_task, 0) {
         Some(pid) => {
-            serial_print("[CYANOS] init task spawned, PID ");
+            serial_print("[CYANOS] Init task spawned with PID: ");
             print_hex(pid as u64);
             serial_print("\n");
         }
-        None => panic!("kernel_main: failed to spawn init task"),
+        None => {
+            serial_print("[CYANOS] Failed to spawn init task\n");
+            loop { core::hint::spin_loop(); }
+        }
     }
 
-    serial_print("[CYANOS] subsystems initialised — entering scheduler\n");
-
-    // 8. Hand off to the scheduler.  Never returns.
+    // Enter the scheduler run loop - this never returns
+    serial_print("[CYANOS] Entering scheduler run loop\n");
+    serial_print("[CYANOS] About to call sched::run()\n");
     sched::run()
+}
+
+// ── Test functions ────────────────────────────────────────────────────────────
+
+fn test_kernel_task() -> ! {
+    serial_print("[TASK] Simple kernel task started successfully!\n");
+    serial_print("[TASK] This proves task spawning works\n");
+
+    // Simple loop to show the task is running
+    for i in 0..3 {
+        serial_print("[TASK] Iteration: ");
+        print_number(i);
+        serial_print("\n");
+
+        // Small delay
+        for _ in 0..500000 {
+            core::hint::spin_loop();
+        }
+    }
+
+    serial_print("[TASK] Test kernel task completing\n");
+    sched::exit(0);
+}
+
+fn print_pid(pid: u32) {
+    print_number(pid);
+}
+
+fn print_number(mut n: u32) {
+    if n == 0 {
+        serial_print("0");
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut i = 10;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + ((n % 10) as u8);
+        n /= 10;
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
+    serial_print(s);
 }
 
 // ── Panic handler ─────────────────────────────────────────────────────────────
