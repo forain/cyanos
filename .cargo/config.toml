@@ -31,6 +31,10 @@ rustflags = [
     "-C", "linker=rust-lld",
     "-C", "relocation-model=static",
     "-C", "code-model=small",       # AArch64 only accepts small/tiny/large
+    "-C", "link-arg=-z",
+    "-C", "link-arg=max-page-size=0x1000",
+    "-C", "link-arg=-s",
+    "-C", "strip=symbols",
 ]
 
 # ── x86-64 — Limine UEFI on a FAT32 disk image ───────────────────────────────
