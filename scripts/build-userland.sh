@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TARGET="aarch64-linux-android"
+TARGET="aarch64-unknown-none"
 MODE="debug"
 CHECK=false
 
@@ -44,7 +44,7 @@ fi
 
 echo "[userland] cargo build …"
 cargo build "${CARGO_ARGS[@]}" \
-    --config "target.${TARGET}.rustflags=[\"-C\",\"link-arg=-nostartfiles\",\"-C\",\"link-arg=-static\"]"
+    --config "target.${TARGET}.rustflags=[\"-C\",\"link-arg=--entry=_start\",\"-C\",\"link-arg=-static\",\"-C\",\"linker=rust-lld\"]"
 
 OUT="userland/target/${TARGET}/${MODE}"
 echo ""
