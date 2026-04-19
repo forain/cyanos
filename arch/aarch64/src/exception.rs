@@ -479,7 +479,136 @@ unsafe extern "C" fn irq_dispatch() {
 /// EL1 synchronous exception — always a kernel bug; panic with diagnostics.
 #[no_mangle]
 unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
-    panic!("EL1 sync exception: ESR={:#010x} ELR={:#010x}", esr, elr);
+    // Get additional fault information
+    let far: u64;
+    core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
+
+    // Print detailed data abort information
+    print_detailed_data_abort_info(esr, elr, far);
+
+    // This is a real kernel fault - we need to panic and debug the issue
+    panic!("EL1 sync exception: ESR={:#010x} ELR={:#010x} FAR={:#010x}", esr, elr, far);
+}
+
+/// Print detailed information about data abort exceptions for debugging
+unsafe fn print_detailed_data_abort_info(esr: u64, elr: u64, far: u64) {
+    extern "C" { fn arch_serial_putc(b: u8); }
+
+    let ec = (esr >> 26) & 0x3F;  // Exception Class
+    let iss = esr & 0x1FFFFFF;    // Instruction Specific Syndrome
+
+    // Print basic info
+    let msg = b"[CYANOS] DETAILED DATA ABORT:\r\n";
+    for &b in msg { arch_serial_putc(b); }
+
+    // Exception Class
+    let ec_prefix = b"EC=0x";
+    for &b in ec_prefix { arch_serial_putc(b); }
+
+    let ec_hex = ((ec >> 4) & 0xF, ec & 0xF);
+    for nibble in [ec_hex.0, ec_hex.1] {
+        let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + nibble as u8 - 10 };
+        arch_serial_putc(c);
+    }
+
+    if ec == 0x20 {
+        let msg = b" (Instruction Abort, EL0)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else if ec == 0x21 {
+        let msg = b" (Instruction Abort, current EL)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else if ec == 0x24 {
+        let msg = b" (Data Abort, EL0)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else if ec == 0x25 {
+        let msg = b" (Data Abort, current EL)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else {
+        let msg = b" (Unknown exception class)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    }
+
+    // For data/instruction aborts, decode fault status
+    if ec == 0x24 || ec == 0x25 || ec == 0x20 || ec == 0x21 {
+        let dfsc = iss & 0x3F;  // Data/Instruction Fault Status Code (bits 5:0)
+        let wnr = (iss >> 6) & 1;  // Write not Read (bit 6, data aborts only)
+        let s1ptw = (iss >> 7) & 1;  // Stage 1 translation table walk (bit 7)
+
+        // Print DFSC manually to avoid type mismatch issues
+        let dfsc_prefix = b"DFSC=0x";
+        for &b in dfsc_prefix { arch_serial_putc(b); }
+
+        let dfsc_hex = ((dfsc >> 4) & 0xF, dfsc & 0xF);
+        for nibble in [dfsc_hex.0, dfsc_hex.1] {
+            let c = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + nibble as u8 - 10 };
+            arch_serial_putc(c);
+        }
+
+        if dfsc >= 0b000000 && dfsc <= 0b000011 {
+            let msg = b" (Address size fault)\r\n";
+            for &b in msg { arch_serial_putc(b); }
+        } else if dfsc >= 0b000100 && dfsc <= 0b000111 {
+            let msg = b" (Translation fault)\r\n";
+            for &b in msg { arch_serial_putc(b); }
+        } else if dfsc >= 0b001001 && dfsc <= 0b001011 {
+            let msg = b" (Access flag fault)\r\n";
+            for &b in msg { arch_serial_putc(b); }
+        } else if dfsc >= 0b001101 && dfsc <= 0b001111 {
+            let msg = b" (Permission fault)\r\n";
+            for &b in msg { arch_serial_putc(b); }
+        } else if dfsc == 0b010000 {
+            let msg = b" (Synchronous External abort)\r\n";
+            for &b in msg { arch_serial_putc(b); }
+        } else if dfsc == 0b010001 {
+            let msg = b" (Synchronous Tag Check Fault)\r\n";
+            for &b in msg { arch_serial_putc(b); }
+        } else if dfsc == 0b100001 {
+            let msg = b" (Alignment fault)\r\n";
+            for &b in msg { arch_serial_putc(b); }
+        } else if dfsc == 0b110000 {
+            let msg = b" (TLB conflict abort)\r\n";
+            for &b in msg { arch_serial_putc(b); }
+        } else {
+            let msg = b" (Unknown fault)\r\n";
+            for &b in msg { arch_serial_putc(b); }
+        }
+
+        if ec == 0x24 || ec == 0x25 {  // Data aborts
+            if wnr == 1 {
+                let wnr_msg = b"WnR=1 (Write access)\r\n";
+                for &b in wnr_msg { arch_serial_putc(b); }
+            } else {
+                let wnr_msg = b"WnR=0 (Read access)\r\n";
+                for &b in wnr_msg { arch_serial_putc(b); }
+            }
+        }
+
+        if s1ptw == 1 {
+            let s1ptw_msg = b"S1PTW=1 (Stage 1 translation table walk)\r\n";
+            for &b in s1ptw_msg { arch_serial_putc(b); }
+        }
+    }
+
+    // Print registers in hex
+    print_hex_value(b"ESR_EL1=0x", esr);
+    print_hex_value(b"ELR_EL1=0x", elr);
+    print_hex_value(b"FAR_EL1=0x", far);
+}
+
+/// Print a hex value to serial
+unsafe fn print_hex_value(prefix: &[u8], value: u64) {
+    extern "C" { fn arch_serial_putc(b: u8); }
+
+    for &b in prefix { arch_serial_putc(b); }
+
+    for i in (0..16).rev() {
+        let nibble = ((value >> (i * 4)) & 0xF) as u8;
+        let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+        arch_serial_putc(c);
+    }
+
+    arch_serial_putc(b'\r');
+    arch_serial_putc(b'\n');
 }
 
 /// EL0 fault (non-SVC) — attempt demand-paging, then kill on unhandled faults.

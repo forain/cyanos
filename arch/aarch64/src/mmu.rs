@@ -116,3 +116,274 @@ pub unsafe fn enable_identity() {
     core::arch::asm!("msr SCTLR_EL1, {}", in(reg) s, options(nostack));
     core::arch::asm!("isb", options(nostack, nomem));
 }
+
+/// Debug memory attributes for a given virtual address
+///
+/// This performs a page table walk and prints detailed information about
+/// the memory mapping, attributes, and permissions for the given address.
+pub unsafe fn debug_memory_attributes(addr: usize) {
+    extern "C" { fn arch_serial_putc(b: u8); }
+
+    let msg = b"[CYANOS] MEMORY DEBUG FOR ADDRESS: ";
+    for &b in msg { arch_serial_putc(b); }
+    print_hex_addr(addr as u64);
+
+    // Check if MMU is enabled
+    let sctlr: u64;
+    core::arch::asm!("mrs {v}, SCTLR_EL1", v = out(reg) sctlr, options(nostack, nomem));
+    if sctlr & 1 == 0 {
+        let msg = b"MMU disabled - identity mapping\r\n";
+        for &b in msg { arch_serial_putc(b); }
+        return;
+    }
+
+    // Get current page table base
+    let ttbr0: u64;
+    core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0, options(nostack, nomem));
+
+    let msg = b"TTBR0_EL1: ";
+    for &b in msg { arch_serial_putc(b); }
+    print_hex_addr(ttbr0);
+
+    // Extract address components for page table walk
+    let va = addr as u64;
+    let l0_index = (va >> 39) & 0x1FF;  // bits 47:39
+    let l1_index = (va >> 30) & 0x1FF;  // bits 38:30
+    let l2_index = (va >> 21) & 0x1FF;  // bits 29:21
+    let l3_index = (va >> 12) & 0x1FF;  // bits 20:12
+
+    let msg = b"Page table indices:\r\n";
+    for &b in msg { arch_serial_putc(b); }
+
+    let msg = b"  L0 index: ";
+    for &b in msg { arch_serial_putc(b); }
+    print_dec_value(l0_index);
+
+    let msg = b"  L1 index: ";
+    for &b in msg { arch_serial_putc(b); }
+    print_dec_value(l1_index);
+
+    let msg = b"  L2 index: ";
+    for &b in msg { arch_serial_putc(b); }
+    print_dec_value(l2_index);
+
+    let msg = b"  L3 index: ";
+    for &b in msg { arch_serial_putc(b); }
+    print_dec_value(l3_index);
+
+    // Walk the page table
+    let l0_table = ttbr0 as *const u64;
+
+    if l0_index >= 512 {
+        let msg = b"L0 index out of range\r\n";
+        for &b in msg { arch_serial_putc(b); }
+        return;
+    }
+
+    let l0_entry = l0_table.add(l0_index as usize).read_volatile();
+    let msg = b"L0 entry: ";
+    for &b in msg { arch_serial_putc(b); }
+    print_hex_addr(l0_entry);
+
+    if l0_entry & 1 == 0 {
+        let msg = b"L0 entry invalid (not present)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+        return;
+    }
+
+    let entry_type = (l0_entry >> 1) & 1;
+    if entry_type == 0 {
+        let msg = b"L0 entry is a block descriptor (unexpected)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+        return;
+    }
+
+    // L0 points to L1 table
+    let l1_table_addr = l0_entry & 0xFFFFFFFFF000;  // Extract bits 47:12
+    let l1_table = l1_table_addr as *const u64;
+
+    if l1_index >= 512 {
+        let msg = b"L1 index out of range\r\n";
+        for &b in msg { arch_serial_putc(b); }
+        return;
+    }
+
+    let l1_entry = l1_table.add(l1_index as usize).read_volatile();
+    let msg = b"L1 entry: ";
+    for &b in msg { arch_serial_putc(b); }
+    print_hex_addr(l1_entry);
+
+    if l1_entry & 1 == 0 {
+        let msg = b"L1 entry invalid (not present)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+        return;
+    }
+
+    let entry_type = (l1_entry >> 1) & 1;
+    if entry_type == 0 {
+        // L1 block descriptor (1 GiB block)
+        let msg = b"L1 block descriptor (1 GiB block)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+        decode_block_attributes(l1_entry);
+        return;
+    }
+
+    let msg = b"L1 table descriptor - continuing to L2\r\n";
+    for &b in msg { arch_serial_putc(b); }
+
+    // L1 points to L2 table (not implemented in our simple identity mapping)
+    let msg = b"L2/L3 table walk not implemented (we use 1 GiB blocks)\r\n";
+    for &b in msg { arch_serial_putc(b); }
+}
+
+/// Decode and print block/page descriptor attributes
+unsafe fn decode_block_attributes(entry: u64) {
+    extern "C" { fn arch_serial_putc(b: u8); }
+
+    let msg = b"Block attributes:\r\n";
+    for &b in msg { arch_serial_putc(b); }
+
+    // Access flag (bit 10)
+    let af = (entry >> 10) & 1;
+    if af == 1 {
+        let msg = b"  AF=1 (accessed)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else {
+        let msg = b"  AF=0 (not accessed)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    }
+
+    // Shareability (bits 9:8)
+    let sh = (entry >> 8) & 3;
+    let sh_prefix = b"  SH=0x";
+    for &b in sh_prefix { arch_serial_putc(b); }
+    let sh_digit = b'0' + sh as u8;
+    arch_serial_putc(sh_digit);
+
+    if sh == 0b00 {
+        let msg = b" (non-shareable)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else if sh == 0b01 {
+        let msg = b" (reserved)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else if sh == 0b10 {
+        let msg = b" (outer shareable)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else if sh == 0b11 {
+        let msg = b" (inner shareable)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    }
+
+    // Access permissions (bits 7:6)
+    let ap = (entry >> 6) & 3;
+    let ap_prefix = b"  AP=0x";
+    for &b in ap_prefix { arch_serial_putc(b); }
+    let ap_digit = b'0' + ap as u8;
+    arch_serial_putc(ap_digit);
+
+    if ap == 0b00 {
+        let msg = b" (EL1 RW, EL0 no access)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else if ap == 0b01 {
+        let msg = b" (EL1 RW, EL0 RW)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else if ap == 0b10 {
+        let msg = b" (EL1 RO, EL0 no access)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else if ap == 0b11 {
+        let msg = b" (EL1 RO, EL0 RO)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    }
+
+    // Memory attribute index (bits 4:2)
+    let attr_indx = (entry >> 2) & 7;
+    let msg = b"  AttrIndx=";
+    for &b in msg { arch_serial_putc(b); }
+    print_dec_value(attr_indx);
+
+    if attr_indx == 0 {
+        let msg = b"    (Normal WB/WA)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else if attr_indx == 1 {
+        let msg = b"    (Device nGnRnE)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else {
+        let msg = b"    (Other/Unknown)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    }
+
+    // Execute permissions
+    let uxn = (entry >> 54) & 1;  // User Execute Never
+    let pxn = (entry >> 53) & 1;  // Privileged Execute Never
+
+    if uxn == 1 {
+        let msg = b"  UXN=1 (user execute never)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else {
+        let msg = b"  UXN=0 (user execute allowed)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    }
+
+    if pxn == 1 {
+        let msg = b"  PXN=1 (privileged execute never)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    } else {
+        let msg = b"  PXN=0 (privileged execute allowed)\r\n";
+        for &b in msg { arch_serial_putc(b); }
+    }
+
+    // Physical address (block base)
+    let block_addr = entry & 0xFFFFC0000000;  // Bits 47:30 for 1 GiB blocks
+    let msg = b"  Physical block base: ";
+    for &b in msg { arch_serial_putc(b); }
+    print_hex_addr(block_addr);
+}
+
+/// Print a hex address value to serial
+unsafe fn print_hex_addr(value: u64) {
+    extern "C" { fn arch_serial_putc(b: u8); }
+
+    arch_serial_putc(b'0');
+    arch_serial_putc(b'x');
+
+    for i in (0..16).rev() {
+        let nibble = ((value >> (i * 4)) & 0xF) as u8;
+        let c = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+        arch_serial_putc(c);
+    }
+
+    arch_serial_putc(b'\r');
+    arch_serial_putc(b'\n');
+}
+
+/// Print a decimal value to serial
+unsafe fn print_dec_value(value: u64) {
+    extern "C" { fn arch_serial_putc(b: u8); }
+
+    if value == 0 {
+        arch_serial_putc(b'0');
+    } else {
+        let mut digits = [0u8; 20];
+        let mut num = value;
+        let mut i = 0;
+
+        while num > 0 {
+            digits[i] = (num % 10) as u8 + b'0';
+            num /= 10;
+            i += 1;
+        }
+
+        for j in (0..i).rev() {
+            arch_serial_putc(digits[j]);
+        }
+    }
+
+    arch_serial_putc(b'\r');
+    arch_serial_putc(b'\n');
+}
+
+/// C-compatible wrapper for debug_memory_attributes
+#[no_mangle]
+pub unsafe extern "C" fn debug_memory_attributes_aarch64(addr: usize) {
+    debug_memory_attributes(addr);
+}
