@@ -28,6 +28,19 @@ pub fn init() {
             v = in(reg) 0x00FFu64,
             options(nostack)
         );
+
+        // Enable FP/SIMD access via CPACR_EL1.FPEN (bits 21:20) = 0b11
+        // This prevents "Access to SVE, Advanced SIMD, or floating-point functionality trapped" exceptions
+        let mut cpacr: u64;
+        core::arch::asm!("mrs {}, CPACR_EL1", out(reg) cpacr, options(nostack, nomem));
+        cpacr |= 0b11 << 20;  // FPEN = 0b11 (no trapping of FP/SIMD at EL0 and EL1)
+        core::arch::asm!(
+            "msr CPACR_EL1, {}",
+            "isb",
+            in(reg) cpacr,
+            options(nostack)
+        );
+
         // Initialise PL011 UART for early debug output.
         uart::init();
         // Enable the MMU with a 4 GiB identity mapping.  MAIR must be written
