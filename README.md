@@ -9,20 +9,32 @@ Cyanos follows the classic microkernel design: the kernel itself provides only s
 ## Architecture at a glance
 
 ```
-┌──────────────────────────────────────────────┐
-│              User Space (EL0 / Ring 3)        │
-│  ┌──────────┐  ┌──────────┐  ┌─────────────┐ │
-│  │  init    │  │  driver  │  │   server    │ │
-│  │  task    │  │  tasks   │  │   tasks     │ │
-│  └────┬─────┘  └────┬─────┘  └──────┬──────┘ │
-│       │  SVC / SYSCALL  │            │        │
-└───────┼─────────────────┼────────────┼────────┘
-        ↓    Kernel Space (EL1 / Ring 0)
-┌──────────────────────────────────────────────┐
-│  syscall dispatch  │  IPC ports  │  sched    │
-│  mm (buddy+slab)   │  paging     │  VMM      │
-│  boot parsers      │  arch init  │  drivers  │
-└──────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│                  User Space (EL0 / Ring 3)                 │
+│  ┌──────────┐  ┌──────────┐  ┌─────────────┐  ┌─────────┐ │
+│  │   init   │  │  shell   │  │   driver    │  │ server  │ │
+│  │ (PID-1)  │  │   CLI    │  │   tasks     │  │  tasks  │ │
+│  │ ELF load │  │ commands │  │             │  │   VFS   │ │
+│  └────┬─────┘  └────┬─────┘  └──────┬──────┘  └────┬────┘ │
+│       │  SVC / SYSCALL  │            │              │      │
+└───────┼─────────────────┼────────────┼──────────────┼──────┘
+        ↓    Kernel Space (EL1 / Ring 0)               ↓
+┌───────────────────────────────────────────────────────────┐
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐           │
+│ │   syscall   │ │ IPC ports   │ │ scheduler   │           │
+│ │  dispatch   │ │ messaging   │ │ ELF loader  │           │
+│ └─────────────┘ └─────────────┘ └─────────────┘           │
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐           │
+│ │     MM      │ │   paging    │ │    arch     │           │
+│ │ buddy+slab  │ │ VMM+demand  │ │ debug+init  │           │
+│ │   1MB stack │ │   W^X       │ │ FP/SIMD en. │           │
+│ └─────────────┘ └─────────────┘ └─────────────┘           │
+│ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐           │
+│ │ boot parse  │ │   drivers   │ │ kernel shell│           │
+│ │ DTB+Limine  │ │ serial+FB   │ │ help/info   │           │
+│ │ QEMU fallbk │ │   USB+WiFi  │ │ interactive │           │
+│ └─────────────┘ └─────────────┘ └─────────────┘           │
+└───────────────────────────────────────────────────────────┘
 ```
 
 **IPC model** — processes communicate exclusively through *ports* (bounded message queues). The kernel exposes three primitives: `send` (non-blocking enqueue), `recv` (blocking dequeue on owned port), and `call` (send + block on private reply port). There is no shared memory between tasks unless explicitly mapped.
@@ -33,16 +45,17 @@ Cyanos follows the classic microkernel design: the kernel itself provides only s
 
 | Crate | Purpose |
 |---|---|
-| `kernel` | Entry point, `kernel_main`, syscall dispatch, init task |
-| `mm` | Buddy allocator, slab allocator, VMM, page-table interface |
-| `sched` | Cooperative/preemptive scheduler, context switch, IPC blocking |
+| `kernel` | Entry point, `kernel_main`, syscall dispatch, init task, kernel shell |
+| `mm` | Buddy allocator, slab allocator, VMM, page-table interface, ELF mapping |
+| `sched` | Cooperative/preemptive scheduler, context switch, IPC blocking, ELF loading |
 | `ipc` | Port table, message types, `Channel` abstraction |
 | `boot` | Multiboot2, Limine, and Device Tree (FDT) parsers → `BootInfo` |
 | `arch/x86_64` | GDT/TSS, IDT, APIC, PIC, SYSCALL entry, SMP, timer |
-| `arch/aarch64` | MMU, exception vectors, GICv2, generic timer, UART, SMP/PSCI |
+| `arch/aarch64` | MMU, exception vectors, GICv2, generic timer, UART, SMP/PSCI, debug utils |
 | `drivers` | PL011/16550 serial, linear framebuffer |
 | `drivers/usb` | xHCI host controller |
 | `drivers/wifi` | mac80211 + virtio-wifi |
+| `userland` | User-space programs (init, shell, hello) with cyanos-libc |
 | `lib` | `align_up` / `align_down` utilities shared across crates |
 
 ---
@@ -99,18 +112,20 @@ sudo apt install lld    # ld.lld is used for both targets
 
 The workspace default target is `aarch64-unknown-none`. Pass `--target` to switch.
 
+⚠️ **Important**: Use release builds for testing — debug builds may hang during early boot due to large stack requirements.
+
 ```sh
-# AArch64 — QEMU virt (default)
-cargo build --target aarch64-unknown-none
+# AArch64 — QEMU virt (recommended: release mode)
+cargo build --release --target aarch64-unknown-none
 
 # AArch64 — Raspberry Pi 5
-cargo build --target aarch64-unknown-none --features rpi5
+cargo build --release --target aarch64-unknown-none --features rpi5
 
 # x86-64 — Limine UEFI
-cargo build --target x86_64-unknown-none
+cargo build --release --target x86_64-unknown-none
 
-# Release builds (LTO, size-optimised)
-cargo build --release --target aarch64-unknown-none
+# Debug builds (use only for development with additional tooling)
+cargo build --target aarch64-unknown-none
 ```
 
 ---
@@ -120,10 +135,20 @@ cargo build --release --target aarch64-unknown-none
 ### AArch64
 
 ```sh
+# Release mode (recommended for actual testing)
+cargo run --release --target aarch64-unknown-none
+
+# Debug mode (for development only)
 cargo run --target aarch64-unknown-none
 ```
 
 QEMU is configured as the default runner for `aarch64-unknown-none` in `.cargo/config.toml`. It boots the ELF directly with `-kernel`, passing the virt machine's built-in DTB in `x0`.
+
+**Note**: The kernel now includes a comprehensive init system with:
+- ELF loading capabilities for userspace programs
+- Interactive kernel shell with commands (`help`, `info`, `test`)
+- Enhanced debugging and exception handling
+- Improved memory management with 1MB kernel stack
 
 ### x86-64
 
@@ -172,9 +197,11 @@ The script writes `kernel.elf` and updates `config.txt` (`kernel=kernel.elf`, `a
 
 - Cooperative + preemptive round-robin, with per-task signed priority.
 - Context switch saves/restores all callee-saved integer registers **and** FPU/SIMD state (Q0–Q31 on AArch64; XMM0–XMM15 + MXCSR on x86-64) on every switch.
+- **ELF loading** — direct userspace program loading with proper memory mapping and entry point setup.
 - Tasks block on IPC ports (`block_on(port)`) and are unblocked by `send` or port close.
 - SMP: up to 8 CPUs. BSP runs `sched::run()`; APs are started via PSCI `CPU_ON` (AArch64) and SIPI (x86-64), then enter `sched::ap_entry()`.
 - `wait_pid` uses an exit-log side-table to avoid the race where the scheduler reaps a zombie before the waiter resumes.
+- **Enhanced debugging** — detailed task state monitoring and exception diagnostics.
 
 ### IPC (`ipc`)
 
@@ -248,6 +275,40 @@ Firmware → _start (MMU off, x0 = DTB physical address)
 **Per-CPU SYSCALL stacks (x86-64)** — each CPU has a `PerCpuSyscall { kernel_stack_top, user_rsp_save }` struct pointed at by `IA32_KERNEL_GS_BASE`. The syscall entry stub uses `swapgs` + `%gs:0/8` to load the kernel stack and save the user RSP without touching any shared state.
 
 **Exit-log side-table** — `sched::run()` reaps zombie tasks immediately after they exit, but records their exit code in a 256-slot `EXIT_LOG` table keyed by PID. `wait_pid` falls back to this table when `find_pid` returns `None`, eliminating the race between the reaper and the waiter.
+
+**Enhanced debugging** — comprehensive exception analysis on AArch64 with detailed data abort information, memory attribute debugging, and task state monitoring for development and troubleshooting.
+
+**Optimized builds** — release builds use LTO, symbol stripping, and 4KB page alignment for reduced binary size and improved performance. Debug builds require larger stacks due to unoptimized code paths.
+
+---
+
+## Userland programs
+
+CyanOS includes a userland development framework with a minimal C runtime (`cyanos-libc`):
+
+### Built-in programs
+
+- **`init`** — PID-1 initialization process with ELF loading capabilities
+- **`shell`** — Interactive command-line interface with basic Unix commands
+- **`hello`** — Simple "Hello, world!" demonstration program
+
+### Building userland
+
+```sh
+# Build all userland programs in release mode
+./scripts/build-userland.sh --release
+
+# Build in debug mode (larger binaries)
+./scripts/build-userland.sh
+```
+
+The userland build system creates statically-linked binaries using a custom `cyanos-libc` that provides:
+- Linux-compatible syscall ABI (AArch64)
+- Basic libc functions (`printf`, `malloc`, `memcpy`, etc.)
+- Process management (`fork`, `exec`, `wait`)
+- File I/O (when VFS is available)
+
+Programs are embedded directly in the kernel image for simplified distribution and early boot access.
 
 ---
 
