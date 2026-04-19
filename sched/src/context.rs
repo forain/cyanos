@@ -81,8 +81,8 @@ impl CpuContext {
         #[cfg(target_arch = "aarch64")]
         {
             let mut c = Self::zeroed();
-            c.gregs[11] = entry as u64; // x30 (lr) = entry point
-            c.sp        = stack_top as u64;
+            c.gregs[11] = entry as u64;  // x30 (lr) = entry point
+            c.sp = stack_top as u64;
             c
         }
 
@@ -422,3 +422,4 @@ cpu_switch_to:
 iret_to_user:
     iretq
 "#);
+

@@ -3,11 +3,12 @@
 //! Future: replace with a red-black tree keyed on virtual runtime (à la CFS).
 
 use super::task::{Pid, Task, TaskState};
-
 pub const MAX_TASKS: usize = 256;
 
+use alloc::boxed::Box;
+
 pub struct RunQueue {
-    pub tasks: [Option<Task>; MAX_TASKS],
+    pub tasks: [Option<Box<Task>>; MAX_TASKS],
     len:       usize,
     cursor:    usize,
 }
@@ -18,7 +19,7 @@ impl RunQueue {
     }
 
     /// Insert a task into the first free slot. Returns false if the queue is full.
-    pub fn enqueue(&mut self, task: Task) -> bool {
+    pub fn enqueue(&mut self, task: Box<Task>) -> bool {
         for slot in &mut self.tasks {
             if slot.is_none() {
                 *slot = Some(task);
@@ -61,11 +62,11 @@ impl RunQueue {
     }
 
     pub fn get_mut(&mut self, idx: usize) -> Option<&mut Task> {
-        self.tasks[idx].as_mut()
+        self.tasks[idx].as_mut().map(|boxed_task| boxed_task.as_mut())
     }
 
     pub fn get(&self, idx: usize) -> Option<&Task> {
-        self.tasks[idx].as_ref()
+        self.tasks[idx].as_ref().map(|boxed_task| boxed_task.as_ref())
     }
 
     /// Find the slot index of the task with the given PID.
@@ -114,7 +115,7 @@ impl RunQueue {
 
     /// Remove the task at `idx` from the run queue and return it so the caller
     /// can free its resources.  Decrements the task count.
-    pub fn remove(&mut self, idx: usize) -> Option<Task> {
+    pub fn remove(&mut self, idx: usize) -> Option<Box<Task>> {
         let t = self.tasks[idx].take();
         if t.is_some() { self.len = self.len.saturating_sub(1); }
         t

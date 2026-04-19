@@ -8,6 +8,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod clone;
 pub mod context;
 pub mod futex;
@@ -100,8 +102,7 @@ fn cpu_id() -> usize {
 }
 
 /// Saved register state for each CPU's scheduler idle loop.
-static mut SCHEDULER_CTX: [CpuContext; MAX_CPUS] =
-    [const { CpuContext::zeroed() }; MAX_CPUS];
+static mut SCHEDULER_CTX: [CpuContext; MAX_CPUS] = [const { CpuContext::zeroed() }; MAX_CPUS];
 
 /// Raw pointer to each CPU's currently-running task's `CpuContext`.
 /// Non-null only while a task is active on that CPU.
@@ -131,19 +132,109 @@ pub fn set_task_exit_hook(f: fn(u32)) {
 /// `entry` must be a `fn() -> !`; the task runs until it calls `exit()`.
 /// Returns the new task's PID, or `None` if the run queue is full.
 pub fn spawn(entry: fn() -> !, priority: i8) -> Option<Pid> {
-    // Allocate an 8 KiB kernel stack (order 1 = 2 × PAGE_SIZE).
+    // Validate entry point is not null
+    let entry_addr = entry as usize;
+    if entry_addr == 0 {
+        return None;
+    }
+
+    let pid = alloc_pid();
+
+    extern "C" { fn arch_serial_putc(b: u8); }
+    let msg1 = b"spawn: about to create Task::new_kernel FIRST\r\n";
+    for &b in msg1 { unsafe { arch_serial_putc(b); } }
+
+    // Get current page table for kernel task
+    let current_page_table = unsafe {
+        let mut ttbr0: u64;
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr0, options(nostack, nomem));
+        ttbr0 as usize
+    };
+
+    let debug_pt = b"spawn: current page table: 0x";
+    for &b in debug_pt { unsafe { arch_serial_putc(b); } }
+    for i in (0..16).rev() {
+        let nibble = ((current_page_table >> (i * 4)) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        unsafe { arch_serial_putc(ch); }
+    }
+    let debug_newline = b"\r\n";
+    for &b in debug_newline { unsafe { arch_serial_putc(b); } }
+
+    // Allocate task FIRST to avoid collision
+    let mut t = Task::new_kernel(pid, entry_addr, 0, 0, current_page_table);
+
+    let msg_task_done = b"spawn: Task::new_kernel returned, now allocating stack\r\n";
+    for &b in msg_task_done { unsafe { arch_serial_putc(b); } }
+
+    // Now allocate an 8 KiB kernel stack (order 1 = 2 × PAGE_SIZE).
     let stack_base = mm::buddy::alloc(1)?;
+
+    // Validate stack allocation
+    if stack_base == 0 {
+        return None;
+    }
+
     let stack_size = mm::buddy::PAGE_SIZE * 2;
+    let stack_top = stack_base + stack_size;
 
-    // Zero the stack — alloc returns a physical address; with no MMU (AArch64)
-    // or identity mapping (x86-64) this is directly writeable.
-    unsafe { (stack_base as *mut u8).write_bytes(0, stack_size); }
+    // Debug stack allocation
+    let debug_msg = b"spawn: stack_base=0x";
+    for &b in debug_msg { unsafe { arch_serial_putc(b); } }
+    for i in (0..16).rev() {
+        let nibble = ((stack_base >> (i * 4)) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        unsafe { arch_serial_putc(ch); }
+    }
+    let debug_msg2 = b" stack_size=0x";
+    for &b in debug_msg2 { unsafe { arch_serial_putc(b); } }
+    for i in (0..8).rev() {
+        let nibble = ((stack_size >> (i * 4)) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        unsafe { arch_serial_putc(ch); }
+    }
+    let debug_msg3 = b" stack_top=0x";
+    for &b in debug_msg3 { unsafe { arch_serial_putc(b); } }
+    for i in (0..16).rev() {
+        let nibble = ((stack_top >> (i * 4)) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        unsafe { arch_serial_putc(ch); }
+    }
+    let debug_msg4 = b"\r\n";
+    for &b in debug_msg4 { unsafe { arch_serial_putc(b); } }
 
-    let pid  = alloc_pid();
-    let mut t = Task::new_kernel(pid, entry as usize, stack_base, stack_size, 0);
+    // Validate stack bounds
+    if stack_top <= stack_base {
+        mm::buddy::free(stack_base, 1);
+        return None;
+    }
+
+    // Update task with proper stack info
+    t.kernel_stack = stack_base;
+
+    // Update the context to use the correct stack
+    unsafe {
+        let ctx_ptr = (&mut t.ctx) as *mut context::CpuContext;
+
+        // Reset the stack pointer to the correct value
+        let sp_ptr = (ctx_ptr as usize + core::mem::offset_of!(context::CpuContext, sp)) as *mut u64;
+        core::ptr::write_volatile(sp_ptr, stack_top as u64);
+
+        let ctx_update_msg = b"spawn: Updated task context with new stack\r\n";
+        for &b in ctx_update_msg { arch_serial_putc(b); }
+    }
+
+    let msg2 = b"spawn: Task::new_kernel returned\r\n";
+    for &b in msg2 { unsafe { arch_serial_putc(b); } }
+
     t.priority = priority;
 
+    let msg3 = b"spawn: about to enqueue task\r\n";
+    for &b in msg3 { unsafe { arch_serial_putc(b); } }
+
     if RUN_QUEUE.lock().enqueue(t) {
+        let msg4 = b"spawn: task enqueued successfully\r\n";
+        for &b in msg4 { unsafe { arch_serial_putc(b); } }
         Some(pid)
     } else {
         mm::buddy::free(stack_base, 1);
@@ -153,102 +244,170 @@ pub fn spawn(entry: fn() -> !, priority: i8) -> Option<Pid> {
 
 /// Enter the scheduler run loop.  Never returns.
 pub fn run() -> ! {
-    loop {
-        let maybe_idx = { RUN_QUEUE.lock().pick_next() };
+    scheduler_run_loop()
+}
 
-        if let Some(idx) = maybe_idx {
-            // Grab a raw pointer to the task's context, its PID, and its
-            // page table root, then drop the lock before switching.
-            let (ctx_ptr, pid, _kernel_stack_top, page_table) = {
-                let mut rq = RUN_QUEUE.lock();
-                let t = rq.get_mut(idx).unwrap();
-                let kst = t.kernel_stack + mm::buddy::PAGE_SIZE * 2;
-                (&mut t.ctx as *mut CpuContext, t.pid, kst, t.page_table)
-            };
+/// Never-returning scheduler loop that properly saves its own context.
+/// This function ensures that when tasks yield back to the scheduler,
+/// there is a valid return address and context to restore.
+fn scheduler_run_loop() -> ! {
+    // Create a local variable to hold the actual return point.
+    // This ensures the scheduler has a valid context to return to.
+    fn run_loop() -> ! {
+        extern "C" { fn arch_serial_putc(b: u8); }
+        let msg = b"scheduler_run_loop: entered\r\n";
+        for &b in msg { unsafe { arch_serial_putc(b); } }
 
-            // Update the per-CPU kernel stack pointer used on exception entry
-            // from user space: TSS.rsp0 on x86-64, TPIDR_EL1 on AArch64.
-            unsafe { arch_set_kernel_stack(_kernel_stack_top as u64); }
+        loop {
+            extern "C" { fn arch_serial_putc(b: u8); }
+            let debug_loop = b"scheduler: checking for tasks\r\n";
+            for &b in debug_loop { unsafe { arch_serial_putc(b); } }
 
-            unsafe {
-                let id = cpu_id();
-                CURRENT_CTX[id] = ctx_ptr;
-                CURRENT_PID[id] = pid;
+            let maybe_idx = { RUN_QUEUE.lock().pick_next() };
 
-                // Switch the page-table root for this task (TTBR0_EL1 / CR3).
-                arch_set_page_table(page_table);
+            if let Some(idx) = maybe_idx {
+                let debug_found = b"scheduler: found task to run\r\n";
+                for &b in debug_found { unsafe { arch_serial_putc(b); } }
+                // Switch to the selected task
+                let debug_setup = b"scheduler: setting up task\r\n";
+                for &b in debug_setup { unsafe { arch_serial_putc(b); } }
 
-                // Switch to the task.  Returns here when the task yields back.
-                context::cpu_switch_to(
-                    core::ptr::addr_of_mut!(SCHEDULER_CTX[id]),
-                    ctx_ptr as *const CpuContext,
-                );
+                let (ctx_ptr, pid, _kernel_stack_top, page_table) = {
+                    let debug_lock = b"scheduler: acquiring run queue lock\r\n";
+                    for &b in debug_lock { unsafe { arch_serial_putc(b); } }
 
-                // Task yielded back to scheduler — clear the user page table.
-                arch_set_page_table(0);
+                    let mut rq = RUN_QUEUE.lock();
 
-                CURRENT_CTX[id] = core::ptr::null_mut();
-                CURRENT_PID[id] = 0;
-            }
+                    let debug_get = b"scheduler: getting task from run queue\r\n";
+                    for &b in debug_get { unsafe { arch_serial_putc(b); } }
 
-            // ── Post-switch: update state or reap ────────────────────────────
-            //
-            // If the task is still Running it yielded voluntarily → mark Ready.
-            // If it's Zombie, free its resources now (kernel stack + address space
-            // + IPC ports) and remove it from the run queue.
-            //
-            // zombie_info: (kernel_stack_base, pid, page_table_root, exit_code)
-            let zombie_info: Option<(usize, u32, usize, i32)> = {
-                let mut rq = RUN_QUEUE.lock();
-                if let Some(t) = rq.get_mut(idx) {
-                    if t.state == TaskState::Zombie {
-                        Some((t.kernel_stack, t.pid, t.page_table, t.exit_code))
-                    } else {
-                        if t.state == TaskState::Running {
-                            t.state = TaskState::Ready;
+                    let t = rq.get_mut(idx).unwrap();
+                    let kst = t.kernel_stack + mm::buddy::PAGE_SIZE * 2;
+
+                    let debug_extract = b"scheduler: extracted task data\r\n";
+                    for &b in debug_extract { unsafe { arch_serial_putc(b); } }
+
+                    (&mut t.ctx as *mut CpuContext, t.pid, kst, t.page_table)
+                };
+
+                unsafe {
+                    let debug_unsafe = b"scheduler: entering unsafe block\r\n";
+                    for &b in debug_unsafe { arch_serial_putc(b); }
+
+                    let id = cpu_id();
+
+                    let debug_cpu_id = b"scheduler: got CPU ID\r\n";
+                    for &b in debug_cpu_id { arch_serial_putc(b); }
+
+                    CURRENT_CTX[id] = ctx_ptr;
+                    CURRENT_PID[id] = pid;
+
+                    let debug_set_current = b"scheduler: set current context/PID\r\n";
+                    for &b in debug_set_current { arch_serial_putc(b); }
+
+                    // Update the per-CPU kernel stack pointer used on exception entry
+                    arch_set_kernel_stack(_kernel_stack_top as u64);
+
+                    let debug_set_stack = b"scheduler: set kernel stack\r\n";
+                    for &b in debug_set_stack { arch_serial_putc(b); }
+
+                    // Switch the page-table root for this task
+                    arch_set_page_table(page_table);
+
+                    let debug_set_page_table = b"scheduler: set page table\r\n";
+                    for &b in debug_set_page_table { arch_serial_putc(b); }
+
+                    // Debug: Check context values right before switch
+                    let debug_x30 = (*ctx_ptr).gregs[11];
+                    let debug_sp = (*ctx_ptr).sp;
+
+                    // Print debug info
+                    extern "C" { fn arch_serial_putc(b: u8); }
+                    let msg1 = b"pre-switch x30=0x";
+                    for &b in msg1 { arch_serial_putc(b); }
+                    for i in (0..16).rev() {
+                        let nibble = ((debug_x30 >> (i * 4)) & 0xF) as u8;
+                        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+                        arch_serial_putc(ch);
+                    }
+                    let msg2 = b" sp=0x";
+                    for &b in msg2 { arch_serial_putc(b); }
+                    for i in (0..16).rev() {
+                        let nibble = ((debug_sp >> (i * 4)) & 0xF) as u8;
+                        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+                        arch_serial_putc(ch);
+                    }
+                    let msg3 = b"\r\n";
+                    for &b in msg3 { arch_serial_putc(b); }
+
+                    // Add debug before context switch
+                    let debug_before = b"About to call cpu_switch_to\r\n";
+                    for &b in debug_before { arch_serial_putc(b); }
+
+                    // Switch to the task. The scheduler context will be saved naturally here
+                    // and when the task yields back, we'll continue from this point
+                    context::cpu_switch_to(
+                        core::ptr::addr_of_mut!(SCHEDULER_CTX[id]),
+                        ctx_ptr as *const CpuContext,
+                    );
+
+                    // Add debug after context switch (should never reach here if task runs)
+                    let debug_after = b"Returned from cpu_switch_to\r\n";
+                    for &b in debug_after { arch_serial_putc(b); }
+
+                    // Task yielded back to scheduler — clear the user page table
+                    arch_set_page_table(0);
+
+                    CURRENT_CTX[id] = core::ptr::null_mut();
+                    CURRENT_PID[id] = 0;
+                }
+
+                // Handle post-switch logic (reaping zombies, etc.)
+                let zombie_info: Option<(usize, u32, usize, i32)> = {
+                    let mut rq = RUN_QUEUE.lock();
+                    if let Some(t) = rq.get_mut(idx) {
+                        if t.state == TaskState::Zombie {
+                            Some((t.kernel_stack, t.pid, t.page_table, t.exit_code))
+                        } else {
+                            if t.state == TaskState::Running {
+                                t.state = TaskState::Ready;
+                            }
+                            None
                         }
+                    } else {
                         None
                     }
-                } else {
-                    None
+                };
+
+                if let Some((stack_base, pid, page_table, exit_code)) = zombie_info {
+                    // Call exit hook and cleanup
+                    let hook_ptr = TASK_EXIT_HOOK.load(Ordering::Acquire);
+                    if !hook_ptr.is_null() {
+                        let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
+                        hook(pid);
+                    }
+                    log_exit(pid, exit_code);
+                    { RUN_QUEUE.lock().remove(idx); }
+                    let _ = page_table;
+                    mm::buddy::free(stack_base, 1);
                 }
-            };
+            } else {
+                // No runnable task — wait for an interrupt to make one ready
+                let debug_no_task = b"scheduler: no runnable tasks found\r\n";
+                for &b in debug_no_task { unsafe { arch_serial_putc(b); } }
 
-            if let Some((stack_base, pid, page_table, exit_code)) = zombie_info {
-                // Call the registered exit hook (IPC port cleanup) before
-                // dropping the task.  The hook pointer is read atomically;
-                // null means no hook registered yet.
-                let hook_ptr = TASK_EXIT_HOOK.load(Ordering::Acquire);
-                if !hook_ptr.is_null() {
-                    let hook: fn(u32) = unsafe { core::mem::transmute(hook_ptr) };
-                    hook(pid);
+                // Add delay to prevent spamming
+                for _ in 0..10000 {
+                    core::hint::spin_loop();
                 }
-
-                // Save exit code before removing the task so that a concurrent
-                // wait_pid() can still retrieve it after find_pid() returns None.
-                log_exit(pid, exit_code);
-
-                // Remove task from run queue.  Dropping the Task drops its
-                // AddressSpace (if any), which frees all VMA backing pages and
-                // the page-table root via AddressSpace::drop().
-                { RUN_QUEUE.lock().remove(idx); }
-
-                // page_table was captured above so the value is visible to
-                // future tooling (debuggers, tracing).  The actual free happens
-                // in AddressSpace::drop() above; we must NOT free it again here
-                // (double-free).  Kernel tasks with no AddressSpace always have
-                // page_table == 0, so this is always a no-op for them anyway.
-                let _ = page_table;
-
-                // Free the kernel stack allocation (order 1 = 2 × PAGE_SIZE).
-                mm::buddy::free(stack_base, 1);
             }
-        } else {
-            // No runnable task — wait for an interrupt to make one ready.
-            core::hint::spin_loop();
         }
     }
+
+    // Call the actual run loop
+    run_loop()
 }
+
 
 /// Voluntarily yield the rest of this task's time-slice.
 ///
@@ -491,6 +650,40 @@ pub fn spawn_user(user_entry: usize, user_stack_top: usize, priority: i8) -> Opt
     } else {
         mm::buddy::free(stack_base, 1);
         mm::buddy::free(page_table_root, 0);
+        None
+    }
+}
+
+/// Spawn a user-mode task with an existing address space.
+///
+/// Allocates an 8 KiB kernel stack but reuses the provided address space.
+/// This is used when loading ELF binaries to avoid creating a new empty
+/// address space that would lose the loaded program data.
+/// Returns the new PID on success.
+pub fn spawn_user_with_address_space(
+    user_entry: usize,
+    user_stack_top: usize,
+    address_space: mm::vmm::AddressSpace,
+    priority: i8
+) -> Option<Pid> {
+    let stack_base = mm::buddy::alloc(1)?;
+    let stack_size = mm::buddy::PAGE_SIZE * 2;
+    unsafe { (stack_base as *mut u8).write_bytes(0, stack_size); }
+
+    let pid              = alloc_pid();
+    let kernel_stack_top = stack_base + stack_size;
+    let page_table_root  = address_space.root();
+    let ctx = CpuContext::new_user_task(user_entry, user_stack_top, kernel_stack_top);
+
+    let mut t = Task::new_kernel(pid, 0, stack_base, stack_size, page_table_root);
+    t.ctx           = ctx;
+    t.priority      = priority;
+    t.address_space = Some(address_space);
+
+    if RUN_QUEUE.lock().enqueue(t) {
+        Some(pid)
+    } else {
+        mm::buddy::free(stack_base, 1);
         None
     }
 }
@@ -1000,4 +1193,124 @@ pub fn alloc_pid() -> Pid {
     let p = *n;
     *n = (*n).checked_add(1).unwrap_or(1); // never produce 0
     p
+}
+
+// Helper functions for debug output
+fn serial_print(s: &str) {
+    for b in s.bytes() {
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use core::arch::asm;
+                // Wait until THRE (Transmit Holding Register Empty) is set.
+                loop {
+                    let mut status: u8;
+                    asm!("in al, dx", out("al") status, in("dx") 0x3FDu16,
+                         options(nomem, nostack));
+                    if status & 0x20 != 0 { break; }
+                }
+                asm!("out dx, al", in("dx") 0x3F8u16, in("al") b,
+                     options(nomem, nostack));
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // Select UART base to match the board compiled for.
+                #[cfg(not(feature = "rpi5"))]
+                let base = 0x09000000usize;       // QEMU virt PL011
+                #[cfg(feature = "rpi5")]
+                let base = 0x107D_0010_00usize;   // RPi5 RP1 PL011
+                // Wait until TX FIFO not full (FR register bit 5 = TXFF).
+                let fr = (base + 0x18) as *const u32;
+                while fr.read_volatile() & (1 << 5) != 0 {}
+                let dr = base as *mut u32;
+                dr.write_volatile(b as u32);
+            }
+        }
+        if b == b'\n' {
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use core::arch::asm;
+                    loop {
+                        let mut status: u8;
+                        asm!("in al, dx", out("al") status, in("dx") 0x3FDu16,
+                             options(nomem, nostack));
+                        if status & 0x20 != 0 { break; }
+                    }
+                    asm!("out dx, al", in("dx") 0x3F8u16, in("al") b'\r',
+                         options(nomem, nostack));
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    #[cfg(not(feature = "rpi5"))]
+                    let base = 0x09000000usize;
+                    #[cfg(feature = "rpi5")]
+                    let base = 0x107D_0010_00usize;
+                    let fr = (base + 0x18) as *const u32;
+                    while fr.read_volatile() & (1 << 5) != 0 {}
+                    let dr = base as *mut u32;
+                    dr.write_volatile(b'\r' as u32);
+                }
+            }
+        }
+    }
+}
+
+fn print_hex(mut n: u64) {
+    serial_print("0x");
+    let mut buf = [0u8; 16];
+    let mut i = 16;
+    if n == 0 {
+        serial_print("0");
+        return;
+    }
+    while n > 0 {
+        i -= 1;
+        buf[i] = b"0123456789abcdef"[(n & 0xF) as usize];
+        n >>= 4;
+    }
+    for &c in &buf[i..] {
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                use core::arch::asm;
+                loop {
+                    let mut status: u8;
+                    asm!("in al, dx", out("al") status, in("dx") 0x3FDu16,
+                         options(nomem, nostack));
+                    if status & 0x20 != 0 { break; }
+                }
+                asm!("out dx, al", in("dx") 0x3F8u16, in("al") c,
+                     options(nomem, nostack));
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                #[cfg(not(feature = "rpi5"))]
+                let base = 0x09000000usize;
+                #[cfg(feature = "rpi5")]
+                let base = 0x107D_0010_00usize;
+                let fr = (base + 0x18) as *const u32;
+                while fr.read_volatile() & (1 << 5) != 0 {}
+                let dr = base as *mut u32;
+                dr.write_volatile(c as u32);
+            }
+        }
+    }
+}
+
+fn print_pid(pid: u32) {
+    if pid == 0 {
+        serial_print("0");
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut i = 10;
+    let mut n = pid;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + ((n % 10) as u8);
+        n /= 10;
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
+    serial_print(s);
 }

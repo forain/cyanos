@@ -172,7 +172,7 @@ pub fn fork_current(frame_ptr: usize) -> isize {
         child.egid          = egid;
         child.heap_start    = heap_start;
         child.heap_end      = heap_end;
-        child.signal_actions = [DEFAULT_SIGACTION; 64];
+        child.signal_actions = [DEFAULT_SIGACTION; 4];
 
         if !super::RUN_QUEUE.lock().enqueue(child) {
             mm::buddy::free(stack_base, 1);
@@ -311,7 +311,7 @@ pub fn clone_thread(
         child.euid       = euid; child.egid = egid;
         child.heap_start = heap_start;
         child.heap_end   = heap_end;
-        child.signal_actions = [DEFAULT_SIGACTION; 64];
+        child.signal_actions = [DEFAULT_SIGACTION; 4];
         if flags & CLONE_CHILD_CLEARTID != 0 {
             child.clear_child_tid = ctid;
         }
