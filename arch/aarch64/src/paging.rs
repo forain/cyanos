@@ -41,12 +41,14 @@ pub unsafe fn map_4k(pgd: *mut u64, virt: usize, phys: usize, flags: PageDescFla
     let l2 = (virt >> 21) & 0x1FF;
     let l3 = (virt >> 12) & 0x1FF;
 
+
     let p1 = match ensure_table(pgd, l0) { Some(p) => p, None => return false };
     let p2 = match ensure_table(p1,  l1) { Some(p) => p, None => return false };
     let p3 = match ensure_table(p2,  l2) { Some(p) => p, None => return false };
 
     // L3 entry: page descriptor (bit 1 = 1, bit 0 = 1).
-    p3.add(l3).write(phys as u64 | flags.bits() | 0b11);
+    let final_entry = phys as u64 | flags.bits() | 0b11;
+    p3.add(l3).write(final_entry);
 
     // Flush TLB for this address (inner-shareable broadcast).
     core::arch::asm!(
@@ -160,12 +162,64 @@ pub unsafe extern "C" fn arch_tlb_shootdown_all() {
 /// user task, and with 0 on return to the scheduler idle loop.
 #[no_mangle]
 pub unsafe extern "C" fn arch_set_page_table(root: usize) {
+    // Debug output
+    extern "C" { fn serial_print_bytes(ptr: *const u8, len: usize); fn arch_serial_putc(ch: u8); }
+    if root == 0 {
+        let msg = b"[MMU] Clearing TTBR0_EL1 (back to kernel)\r\n";
+        serial_print_bytes(msg.as_ptr(), msg.len());
+    } else {
+        let msg = b"[MMU] Setting TTBR0_EL1 to userspace page table: 0x";
+        serial_print_bytes(msg.as_ptr(), msg.len());
+        for shift in (0..16).rev() {
+            let nibble = (root >> (shift * 4)) & 0xF;
+            let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+            arch_serial_putc(ch);
+        }
+        let debug_nl = b"\r\n";
+        serial_print_bytes(debug_nl.as_ptr(), debug_nl.len());
+    };
+
     core::arch::asm!(
         "msr ttbr0_el1, {r}",
         "isb",
         r = in(reg) root as u64,
         options(nostack)
     );
+}
+
+// ── arch_alloc_page_table_root ────────────────────────────────────────────────
+
+// ── Next user page table storage ─────────────────────────────────────────────
+
+/// Storage for the next user page table to be activated by ret_to_user.
+/// This allows the scheduler to remain in kernel page tables during context switch.
+static mut NEXT_USER_PAGE_TABLE: usize = 0;
+
+/// Store the next user page table for ret_to_user to pick up.
+/// Called by the scheduler before cpu_switch_to for userspace tasks.
+#[no_mangle]
+pub unsafe extern "C" fn arch_store_next_user_page_table(page_table: usize) {
+    extern "C" { fn arch_serial_putc(ch: u8); }
+    let msg = b"[PAGING] Storing page table: 0x";
+    for &b in msg { arch_serial_putc(b); }
+    for shift in (0..16).rev() {
+        let nibble = (page_table >> (shift * 4)) & 0xF;
+        let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+        arch_serial_putc(ch);
+    }
+    let msg = b"\r\n";
+    for &b in msg { arch_serial_putc(b); }
+
+    NEXT_USER_PAGE_TABLE = page_table;
+}
+
+/// Get and clear the stored user page table.
+/// Called by ret_to_user to switch page tables just before eret.
+#[no_mangle]
+pub unsafe extern "C" fn arch_get_next_user_page_table() -> usize {
+    let pt = NEXT_USER_PAGE_TABLE;
+    NEXT_USER_PAGE_TABLE = 0;
+    pt
 }
 
 // ── arch_alloc_page_table_root ────────────────────────────────────────────────
@@ -179,6 +233,41 @@ pub unsafe extern "C" fn arch_alloc_page_table_root() -> usize {
     match mm::buddy::alloc(0) {
         Some(phys) => {
             (phys as *mut u8).write_bytes(0, mm::buddy::PAGE_SIZE);
+
+            // BRUTE FORCE: Map entire kernel memory region as read-write to debug
+            extern "C" { fn serial_print_bytes(ptr: *const u8, len: usize); }
+
+            let kernel_base = 0x40000000usize;  // Start earlier - include all possible kernel regions
+            let kernel_end = 0x44000000usize;   // 64MB total - very generous over-mapping to debug
+            let rw_flags = PageDescFlags::VALID | PageDescFlags::AF | PageDescFlags::INNER_SHR;
+                         // No RDONLY flag = read-write for everything (debugging)
+
+            let debug_msg = b"[PAGING] BRUTE FORCE: Mapping entire kernel 0x40000000-0x44000000 (RW)\r\n";
+            serial_print_bytes(debug_msg.as_ptr(), debug_msg.len());
+
+            let mut addr = kernel_base;
+            while addr < kernel_end {
+                map_4k(phys as *mut u64, addr, addr, rw_flags);
+                addr += mm::buddy::PAGE_SIZE;
+            }
+
+            // Map critical device regions (UART for debug output)
+            let uart_base = 0x09000000usize;
+            let uart_end = 0x09100000usize;
+            let device_flags = PageDescFlags::VALID | PageDescFlags::AF | PageDescFlags::INNER_SHR | PageDescFlags::ATTR_DEV;
+
+            let debug_msg2 = b"[PAGING] Mapping UART device 0x09000000-0x09100000\r\n";
+            serial_print_bytes(debug_msg2.as_ptr(), debug_msg2.len());
+
+            let mut addr = uart_base;
+            while addr < uart_end {
+                map_4k(phys as *mut u64, addr, addr, device_flags);
+                addr += mm::buddy::PAGE_SIZE;
+            }
+
+            let debug_msg3 = b"[PAGING] All kernel and device mappings complete\r\n";
+            serial_print_bytes(debug_msg3.as_ptr(), debug_msg3.len());
+
             phys
         }
         None => 0,
@@ -197,6 +286,10 @@ fn translate_flags(bits: u64) -> PageDescFlags {
     if !src.contains(PageFlags::WRITABLE){ f |= PageDescFlags::RDONLY; }
     if !src.contains(PageFlags::EXECUTE) { f |= PageDescFlags::NO_EXEC; }
     if src.contains(PageFlags::NOCACHE)  { f |= PageDescFlags::ATTR_DEV; } // MAIR index 1
+
+    // EXECUTE flag processing: If EXECUTE is set, we don't add NO_EXEC
+    // If EXECUTE is not set, NO_EXEC is already added above in line 264
+
     f
 }
 
@@ -207,6 +300,8 @@ pub unsafe extern "C" fn arch_map_page(
     phys: usize,
     flags: u64,
 ) -> bool {
+    // Page table mapping: virt -> phys with specified flags
+
     map_4k(page_table_root as *mut u64, virt, phys, translate_flags(flags))
 }
 
