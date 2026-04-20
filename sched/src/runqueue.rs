@@ -6,6 +6,7 @@ use super::task::{Pid, Task, TaskState};
 pub const MAX_TASKS: usize = 256;
 
 use alloc::boxed::Box;
+use alloc::format;
 
 pub struct RunQueue {
     pub tasks: [Option<Box<Task>>; MAX_TASKS],
@@ -18,9 +19,14 @@ impl RunQueue {
         Self { tasks: [const { None }; MAX_TASKS], len: 0, cursor: 0 }
     }
 
+    /// Get the number of tasks currently in the run queue.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
     /// Insert a task into the first free slot. Returns false if the queue is full.
     pub fn enqueue(&mut self, task: Box<Task>) -> bool {
-        for slot in &mut self.tasks {
+        for (idx, slot) in self.tasks.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(task);
                 self.len += 1;
@@ -30,34 +36,34 @@ impl RunQueue {
         false
     }
 
-    /// Pick the next Ready task using priority scheduling.
+    /// Pick the next Ready task using round-robin scheduling.
     ///
-    /// Selects the highest-priority Ready task (largest `Task::priority` value).
-    /// Among tasks with equal priority, round-robin order (cursor) breaks ties
-    /// so no task of equal priority starves.  Marks the chosen task Running.
+    /// Starts from the current cursor position and finds the next Ready task.
+    /// This ensures fair scheduling and prevents any single task from starving.
     /// Returns the slot index so the caller can track which task is active.
     pub fn pick_next(&mut self) -> Option<usize> {
         if self.len == 0 { return None; }
 
-        // Pass 1: find the maximum priority among all Ready tasks.
-        let max_prio = self.tasks.iter()
-            .filter_map(|s| s.as_ref())
-            .filter(|t| t.state == TaskState::Ready)
-            .map(|t| t.priority)
-            .max()?;
-
-        // Pass 2: pick the first Ready task with `max_prio` after the cursor
-        // (round-robin among equals).
-        for i in 0..MAX_TASKS {
-            let idx = (self.cursor + 1 + i) % MAX_TASKS;
-            if let Some(task) = &mut self.tasks[idx] {
-                if task.state == TaskState::Ready && task.priority == max_prio {
-                    task.state  = TaskState::Running;
-                    self.cursor = idx;
-                    return Some(idx);
+        // First, try from cursor to end
+        for i in self.cursor..MAX_TASKS {
+            if let Some(ref task) = self.tasks[i] {
+                if task.state == TaskState::Ready {
+                    self.cursor = (i + 1) % MAX_TASKS;
+                    return Some(i);
                 }
             }
         }
+
+        // Then try from start to cursor
+        for i in 0..self.cursor {
+            if let Some(ref task) = self.tasks[i] {
+                if task.state == TaskState::Ready {
+                    self.cursor = (i + 1) % MAX_TASKS;
+                    return Some(i);
+                }
+            }
+        }
+
         None
     }
 
@@ -117,7 +123,9 @@ impl RunQueue {
     /// can free its resources.  Decrements the task count.
     pub fn remove(&mut self, idx: usize) -> Option<Box<Task>> {
         let t = self.tasks[idx].take();
-        if t.is_some() { self.len = self.len.saturating_sub(1); }
+        if t.is_some() {
+            self.len = self.len.saturating_sub(1);
+        }
         t
     }
 }
