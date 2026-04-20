@@ -229,45 +229,49 @@ static INIT_BINARY: &[u8] = include_bytes!("../../userland/target/aarch64-unknow
 static SHELL_BINARY: &[u8] = include_bytes!("../../userland/target/aarch64-unknown-none/release/shell");
 static HELLO_BINARY: &[u8] = include_bytes!("../../userland/target/aarch64-unknown-none/release/hello");
 
+/// Load and spawn userland init as PID 1
+pub fn load_userland_init() -> Option<u32> {
+    load_and_spawn_elf(INIT_BINARY)
+}
+
 /// Entry point for the kernel's PID-1 init task.  Never returns.
 pub fn init_task_main() -> ! {
     crate::serial_print("[INIT] Kernel init task starting\n");
-    crate::serial_print("[INIT] Testing basic scheduler functionality first\n");
+    crate::serial_print("[INIT] Loading userspace init ELF binary\n");
 
-    // Test basic task spawning and scheduling
-    test_basic_scheduler();
-
-    // Now try loading userspace init
-    crate::serial_print("[INIT] Attempting to load userspace init\n");
+    // Load and execute userspace init (simpler test program)
     match load_and_spawn_elf(INIT_BINARY) {
         Some(pid) => {
             crate::serial_print("[INIT] Userspace init spawned with PID: ");
             print_u32(pid);
             crate::serial_print("\n");
 
-            // Wait for the init process
+            // Wait for shell to complete (it should run indefinitely)
             loop {
                 match sched::wait_pid(pid) {
                     Some(exit_code) => {
-                        crate::serial_print("[INIT] Init process exited with code: ");
+                        crate::serial_print("[INIT] Shell exited with code: ");
                         print_u32(exit_code as u32);
                         crate::serial_print("\n");
                         break;
                     }
                     None => {
+                        // Shell still running, yield
                         sched::yield_now();
                     }
                 }
             }
         }
         None => {
-            crate::serial_print("[INIT] Failed to load userspace init\n");
+            crate::serial_print("[INIT] Failed to load userspace shell\n");
         }
     }
 
-    // Fallback to kernel shell
-    crate::serial_print("[INIT] Starting fallback kernel shell task\n");
-    kernel_shell_task();
+    // If we get here, shell exited or failed - halt system
+    crate::serial_print("[INIT] System halting\n");
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// Test basic scheduler functionality with kernel tasks
@@ -350,6 +354,45 @@ fn extract_binary_from_initrd(path: &str) -> Option<&'static [u8]> {
 }
 
 /// Load an ELF binary and spawn it as a userspace process
+/// Set up the initial userspace stack frame with argc/argv/envp.
+/// Returns the initial stack pointer that should be passed to userspace.
+fn setup_initial_stack(
+    address_space: &mut mm::vmm::AddressSpace,
+    stack_base: usize,
+    stack_size: usize,
+) -> Option<usize> {
+    // For now, set up a minimal stack frame:
+    // argc = 0 (no arguments)
+    // argv = NULL pointer
+    // envp = NULL pointer
+    // auxv terminated with AT_NULL
+
+    let stack_top = stack_base + stack_size;
+    let frame_size = 8 * 4; // 4 usize values: argc, argv, envp, AT_NULL pair
+    let initial_sp = stack_top - frame_size;
+
+    // Find the physical address for this stack location
+    let phys_addr = address_space.virt_to_phys(initial_sp)?;
+
+    unsafe {
+        let frame_ptr = phys_addr as *mut usize;
+
+        // argc = 0 (no command line arguments)
+        *frame_ptr.add(0) = 0;
+
+        // argv = NULL (no arguments)
+        *frame_ptr.add(1) = 0;
+
+        // envp = NULL (no environment variables)
+        *frame_ptr.add(2) = 0;
+
+        // auxv: AT_NULL = 0, value = 0 (terminate auxv)
+        *frame_ptr.add(3) = 0;
+    }
+
+    Some(initial_sp)
+}
+
 fn load_and_spawn_elf(elf_data: &[u8]) -> Option<u32> {
     // Allocate a page table root for the new address space
     let page_table_root = unsafe { arch_alloc_page_table_root() };
@@ -374,6 +417,59 @@ fn load_and_spawn_elf(elf_data: &[u8]) -> Option<u32> {
     print_hex(entry_point);
     crate::serial_print("\n");
 
+    // Verify the entry point is mapped and accessible
+    match address_space.virt_to_phys(entry_point) {
+        Some(phys) => {
+            crate::serial_print("[INIT] Entry point mapped to physical: ");
+            print_hex(phys);
+
+            // Check if physical address is within 256MB limit
+            let ram_base = 0x40000000usize;
+            let ram_size = 0x10000000usize; // 256MB
+            let ram_end = ram_base + ram_size;
+
+            if phys >= ram_base && phys < ram_end {
+                let offset = phys - ram_base;
+                crate::serial_print(" (RAM offset: ");
+                print_hex(offset);
+                crate::serial_print(" / ");
+                print_hex(ram_size);
+                crate::serial_print(" = OK)");
+            } else {
+                crate::serial_print(" (ERROR: BEYOND 256MB RAM!)");
+                return None;
+            }
+            crate::serial_print("\n");
+
+            // Try to read the first 4 bytes of the entry point to verify it's accessible
+            let instruction_bytes = unsafe {
+                let phys_ptr = phys as *const u32;
+                core::ptr::read_volatile(phys_ptr)
+            };
+            crate::serial_print("[INIT] Entry point instruction: ");
+            print_hex(instruction_bytes as usize);
+            crate::serial_print("\n");
+
+            // Read the next several instructions to understand the userspace flow
+            crate::serial_print("[INIT] Next 8 instructions at entry point:\n");
+            unsafe {
+                let phys_ptr = phys as *const u32;
+                for i in 0..8 {
+                    let instr = core::ptr::read_volatile(phys_ptr.add(i));
+                    crate::serial_print("  ");
+                    print_hex((entry_point + i * 4) as usize);
+                    crate::serial_print(": ");
+                    print_hex(instr as usize);
+                    crate::serial_print("\n");
+                }
+            }
+        }
+        None => {
+            crate::serial_print("[INIT] ERROR: Entry point not mapped!\n");
+            return None;
+        }
+    }
+
     // Allocate and map a user stack in the address space
     let stack_base = 0x40000000; // 1GB user stack base
     let stack_size = 0x100000;   // 1MB user stack size
@@ -394,8 +490,49 @@ fn load_and_spawn_elf(elf_data: &[u8]) -> Option<u32> {
     print_hex(stack_top);
     crate::serial_print("\n");
 
+    // Set up initial stack frame with argc/argv/envp for libc
+    let initial_sp = setup_initial_stack(&mut address_space, stack_base, stack_size)?;
+
+    crate::serial_print("[INIT] Initial stack pointer set to: ");
+    print_hex(initial_sp);
+    crate::serial_print("\n");
+
+    // Critical test: Verify that the userspace page table can resolve the entry point
+    crate::serial_print("[INIT] Testing userspace page table resolution for entry point...\n");
+    match address_space.virt_to_phys(entry_point) {
+        Some(resolved_phys) => {
+            crate::serial_print("[INIT] SUCCESS: virt_to_phys(0x");
+            print_hex(entry_point);
+            crate::serial_print(") = 0x");
+            print_hex(resolved_phys);
+            crate::serial_print(" (userspace page table works!)\n");
+
+            // Additional test: Verify that physical memory contains the expected instruction
+            let expected_instruction = 0xd280001du32; // mov x29, #0 (clear frame pointer) - first instruction in proper init
+            let actual_instruction = unsafe {
+                core::ptr::read_volatile(resolved_phys as *const u32)
+            };
+            crate::serial_print("[INIT] Physical memory at entry point: expected=0x");
+            print_hex(expected_instruction as usize);
+            crate::serial_print(", actual=0x");
+            print_hex(actual_instruction as usize);
+            if actual_instruction == expected_instruction {
+                crate::serial_print(" (MATCH - instruction is correct!)\n");
+            } else {
+                crate::serial_print(" (MISMATCH - instruction is wrong!)\n");
+                return None;
+            }
+        }
+        None => {
+            crate::serial_print("[INIT] CRITICAL ERROR: virt_to_phys(0x");
+            print_hex(entry_point);
+            crate::serial_print(") returned None - entry point not mapped in userspace page table!\n");
+            return None;
+        }
+    }
+
     // Spawn the userspace process with the loaded address space
-    sched::spawn_user_with_address_space(entry_point, stack_top, address_space, 0)
+    sched::spawn_user_with_address_space(entry_point, initial_sp, address_space, 0)
 }
 
 // External function to allocate page table root
@@ -502,269 +639,7 @@ fn create_simple_userspace_shell() -> usize {
     code_addr
 }
 
-// ── Kernel shell task ────────────────────────────────────────────────────────
+// ── Kernel shell removed - shell is now userland ELF binary ──
 
-/// Kernel task that runs the shell (runs in separate task context)
-pub fn kernel_shell_task() -> ! {
-    crate::serial_print("\n");
-    crate::serial_print("  ██████╗██╗   ██╗ █████╗ ███╗   ██╗ ██████╗ ███████╗\n");
-    crate::serial_print(" ██╔════╝╚██╗ ██╔╝██╔══██╗████╗  ██║██╔═══██╗██╔════╝\n");
-    crate::serial_print(" ██║      ╚████╔╝ ███████║██╔██╗ ██║██║   ██║███████╗\n");
-    crate::serial_print(" ██║       ╚██╔╝  ██╔══██║██║╚██╗██║██║   ██║╚════██║\n");
-    crate::serial_print(" ╚██████╗   ██║   ██║  ██║██║ ╚████║╚██████╔╝███████║\n");
-    crate::serial_print("  ╚═════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚══════╝\n\n");
-    crate::serial_print("Cyanoshell - Task-based Shell\n");
-    crate::serial_print("Running in separate kernel task context\n");
-    crate::serial_print("Type 'help' for available commands\n\n");
-
-    // Demonstrate shell functionality
-    let demo_commands = ["help", "info", "test"];
-
-    for cmd in demo_commands.iter() {
-        crate::serial_print("cyanos> ");
-        crate::serial_print(cmd);
-        crate::serial_print("\n");
-        execute_shell_command(cmd);
-        crate::serial_print("\n");
-
-        // Delay between commands
-        for _ in 0..1000000 {
-            core::hint::spin_loop();
-        }
-    }
-
-    crate::serial_print("Cyanoshell initialized successfully!\n");
-    crate::serial_print("Running continuous demo...\n\n");
-
-    // Continue running shell loop
-    let mut counter = 0;
-    loop {
-        // Wait
-        for _ in 0..5000000 {
-            core::hint::spin_loop();
-        }
-
-        counter += 1;
-        match counter % 3 {
-            0 => {
-                crate::serial_print("cyanos> help\n");
-                execute_shell_command("help");
-            },
-            1 => {
-                crate::serial_print("cyanos> info\n");
-                execute_shell_command("info");
-            },
-            _ => {
-                crate::serial_print("cyanos> test\n");
-                execute_shell_command("test");
-            }
-        }
-        crate::serial_print("\ncyanos> ");
-    }
-}
-
-fn execute_shell_command(cmd: &str) {
-    match cmd.trim() {
-        "help" => {
-            crate::serial_print("Available commands:\n");
-            crate::serial_print("  help      - Show this help message\n");
-            crate::serial_print("  info      - Show system information\n");
-            crate::serial_print("  test      - Run a simple test\n");
-            crate::serial_print("  clear     - Clear the screen\n");
-            crate::serial_print("  ps        - Show running processes\n");
-        }
-        "info" => {
-            crate::serial_print("Cyanoshell - CyanOS Shell\n");
-            crate::serial_print("Architecture: AArch64\n");
-            crate::serial_print("Status: Running in kernel task context\n");
-            crate::serial_print("Current PID: ");
-            let pid = sched::current_pid();
-            // Convert PID to string manually since we're in no_std
-            if pid == 0 {
-                crate::serial_print("0");
-            } else {
-                let mut buf = [0u8; 10];
-                let mut n = pid;
-                let mut i = 10;
-                while n > 0 {
-                    i -= 1;
-                    buf[i] = b'0' + ((n % 10) as u8);
-                    n /= 10;
-                }
-                let pid_str = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
-                crate::serial_print(pid_str);
-            }
-            crate::serial_print("\n");
-            crate::serial_print("Scheduler: Active\n");
-            crate::serial_print("Context: Task-isolated shell\n");
-        }
-        "test" => {
-            crate::serial_print("Running Cyanoshell system tests...\n");
-            crate::serial_print("✓ Task context working\n");
-            crate::serial_print("✓ Scheduler integration\n");
-            crate::serial_print("✓ Serial I/O operational\n");
-            crate::serial_print("✓ Command processing\n");
-            crate::serial_print("✓ Memory access working\n");
-            crate::serial_print("All Cyanoshell tests passed!\n");
-        }
-        "clear" => {
-            crate::serial_print("\x1b[2J\x1b[H"); // ANSI clear screen
-        }
-        "ps" => {
-            crate::serial_print("Process list:\n");
-            crate::serial_print("  PID 1: init task\n");
-            let current_pid = sched::current_pid();
-            crate::serial_print("  PID ");
-            // Convert PID to string manually
-            if current_pid == 0 {
-                crate::serial_print("0");
-            } else {
-                let mut buf = [0u8; 10];
-                let mut n = current_pid;
-                let mut i = 10;
-                while n > 0 {
-                    i -= 1;
-                    buf[i] = b'0' + ((n % 10) as u8);
-                    n /= 10;
-                }
-                let pid_str = unsafe { core::str::from_utf8_unchecked(&buf[i..]) };
-                crate::serial_print(pid_str);
-            }
-            crate::serial_print(": Cyanoshell\n");
-        }
-        "" => {
-            // Empty command
-        }
-        _ => {
-            crate::serial_print("Unknown command: '");
-            crate::serial_print(cmd);
-            crate::serial_print("'\nType 'help' for available commands.\n");
-        }
-    }
-}
-
-// ── Userspace shell implementation ───────────────────────────────────────────
-
-/// Userspace shell that uses system calls instead of direct kernel functions
-fn userspace_shell() -> ! {
-    // Use system calls to write output
-    sys_write_str("\n");
-    sys_write_str("  ██████╗██╗   ██╗ █████╗ ███╗   ██╗ ██████╗ ███████╗\n");
-    sys_write_str(" ██╔════╝╚██╗ ██╔╝██╔══██╗████╗  ██║██╔═══██╗██╔════╝\n");
-    sys_write_str(" ██║      ╚████╔╝ ███████║██╔██╗ ██║██║   ██║███████╗\n");
-    sys_write_str(" ██║       ╚██╔╝  ██╔══██║██║╚██╗██║██║   ██║╚════██║\n");
-    sys_write_str(" ╚██████╗   ██║   ██║  ██║██║ ╚████║╚██████╔╝███████║\n");
-    sys_write_str("  ╚═════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚══════╝\n\n");
-    sys_write_str("CyanOS Kernel Shell (userspace)\n");
-    sys_write_str("Type 'help' for available commands\n\n");
-
-    // Demonstrate shell functionality with system calls
-    let demo_commands = ["help", "info", "test"];
-
-    for cmd in demo_commands.iter() {
-        sys_write_str("cyanos> ");
-        sys_write_str(cmd);
-        sys_write_str("\n");
-        execute_userspace_command(cmd);
-        sys_write_str("\n");
-
-        // Small delay
-        for _ in 0..1000000 {
-            core::hint::spin_loop();
-        }
-    }
-
-    sys_write_str("Shell initialized successfully in userspace!\n");
-    sys_write_str("cyanos> ");
-
-    // Continue running shell loop
-    let mut counter = 0;
-    loop {
-        // Wait
-        for _ in 0..5000000 {
-            core::hint::spin_loop();
-        }
-
-        counter += 1;
-        match counter % 3 {
-            0 => {
-                sys_write_str("help\n");
-                execute_userspace_command("help");
-            },
-            1 => {
-                sys_write_str("info\n");
-                execute_userspace_command("info");
-            },
-            _ => {
-                sys_write_str("test\n");
-                execute_userspace_command("test");
-            }
-        }
-        sys_write_str("\ncyanos> ");
-    }
-}
-
-// Helper function to write strings using system calls
-fn sys_write_str(s: &str) {
-    let bytes = s.as_bytes();
-    unsafe {
-        // Use write syscall (syscall number 1) to stdout (fd 1)
-        core::arch::asm!(
-            "mov x8, #64",        // write syscall number
-            "mov x0, #1",         // stdout fd
-            "mov x1, {ptr}",      // buffer ptr
-            "mov x2, {len}",      // length
-            "svc #0",             // make system call
-            ptr = in(reg) bytes.as_ptr(),
-            len = in(reg) bytes.len(),
-            out("x8") _,
-            out("x0") _,
-            out("x1") _,
-            out("x2") _,
-        );
-    }
-}
-
-fn execute_userspace_command(cmd: &str) {
-    match cmd.trim() {
-        "help" => {
-            sys_write_str("Available commands:\n");
-            sys_write_str("  help      - Show this help message\n");
-            sys_write_str("  info      - Show system information\n");
-            sys_write_str("  test      - Run a simple test\n");
-            sys_write_str("  clear     - Clear the screen\n");
-            sys_write_str("  reboot    - Restart the system\n");
-        }
-        "info" => {
-            sys_write_str("CyanOS Microkernel (Userspace)\n");
-            sys_write_str("Architecture: AArch64\n");
-            sys_write_str("Status: Running in userspace init task\n");
-            sys_write_str("Memory: Initialized\n");
-            sys_write_str("Scheduler: Active\n");
-            sys_write_str("IPC: Ready\n");
-        }
-        "test" => {
-            sys_write_str("Running userspace system test...\n");
-            sys_write_str("✓ System calls working\n");
-            sys_write_str("✓ Userspace execution context\n");
-            sys_write_str("✓ Shell command processing\n");
-            sys_write_str("✓ Memory access operational\n");
-            sys_write_str("All userspace tests passed!\n");
-        }
-        "clear" => {
-            sys_write_str("\x1b[2J\x1b[H"); // ANSI clear screen
-        }
-        "reboot" => {
-            sys_write_str("System restart not implemented yet.\n");
-            sys_write_str("Please restart QEMU manually.\n");
-        }
-        "" => {
-            // Empty command
-        }
-        _ => {
-            sys_write_str("Unknown command: '");
-            sys_write_str(cmd);
-            sys_write_str("'\nType 'help' for available commands.\n");
-        }
-    }
-}
+// ── Shell is now a separate userland ELF binary ──
+// See userland/shell/src/main.rs for the actual shell implementation

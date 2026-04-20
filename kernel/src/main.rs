@@ -141,6 +141,14 @@ pub fn serial_write_raw(buf: &[u8]) {
     for &b in buf { unsafe { serial_write_byte(b); } }
 }
 
+/// Export for C calling convention from scheduler debugging
+#[no_mangle]
+pub extern "C" fn serial_print_bytes(ptr: *const u8, len: usize) {
+    if ptr.is_null() { return; }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    serial_write_raw(bytes);
+}
+
 // Simple hex formatter for panic messages — no alloc needed.
 fn print_hex(mut n: u64) {
     serial_print("0x");
@@ -198,21 +206,17 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // Initialize IPC
     ipc::init();
 
-    // Spawn the kernel shell task
-    serial_print("[CYANOS] Starting CyanOS kernel shell\n");
-    let entry_addr = init::kernel_shell_task as *const () as usize;
-    serial_print("[CYANOS] Shell task entry address: ");
-    print_hex(entry_addr as u64);
-    serial_print("\n");
+    // Load and spawn userland init as PID 1
+    serial_print("[CYANOS] Loading userland init binary\n");
 
-    match sched::spawn(init::kernel_shell_task, 0) {
+    match init::load_userland_init() {
         Some(pid) => {
-            serial_print("[CYANOS] Init task spawned with PID: ");
-            print_hex(pid as u64);
+            serial_print("[CYANOS] Userland init spawned with PID: ");
+            print_number(pid);
             serial_print("\n");
         }
         None => {
-            serial_print("[CYANOS] Failed to spawn init task\n");
+            serial_print("[CYANOS] Failed to spawn userland init\n");
             loop { core::hint::spin_loop(); }
         }
     }
