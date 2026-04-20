@@ -165,16 +165,19 @@ impl CpuContext {
         #[cfg(target_arch = "aarch64")]
         {
             extern "C" { fn ret_to_user(); }
-            let frame = kernel_stack_top.wrapping_sub(3 * 8);
+            // Build the frame on the kernel stack for ret_to_user
+            // Frame: 4 × 8 bytes = SP_EL0, ELR_EL1, SPSR_EL1, PAGE_TABLE
+            let frame = kernel_stack_top.wrapping_sub(4 * 8);
             unsafe {
                 let p = frame as *mut u64;
                 p.add(0).write(user_sp as u64);     // SP_EL0
                 p.add(1).write(user_entry as u64);  // ELR_EL1
-                p.add(2).write(0u64);               // SPSR_EL1 = EL0t
+                p.add(2).write(0x0u64);             // SPSR_EL1 = EL0t, DAIF unmasked (allows syscalls!)
+                p.add(3).write(0x0u64);             // PAGE_TABLE placeholder - will be set by scheduler
             }
             let mut c = Self::zeroed();
-            c.gregs[11] = ret_to_user as *const () as u64;
-            c.sp        = frame as u64;
+            c.gregs[11] = ret_to_user as *const () as u64;  // x30 (lr) = ret_to_user
+            c.sp = frame as u64;  // SP points to the frame
             c
         }
     }
@@ -223,6 +226,20 @@ extern "C" {
     /// `new` must have been initialised by a prior `cpu_switch_to` or
     /// by `CpuContext::new_task`.
     pub fn cpu_switch_to(old: *mut CpuContext, new: *const CpuContext);
+
+    /// Switch CPU from `old` context to `new` context with page table switch.
+    ///
+    /// Like `cpu_switch_to` but also switches to the specified page table
+    /// atomically during the context switch to avoid race conditions.
+    ///
+    /// # Parameters
+    /// - `old`: Context to save current state into
+    /// - `new`: Context to restore from
+    /// - `page_table`: Physical address of new page table root (0 = no change)
+    ///
+    /// # Safety
+    /// Same as `cpu_switch_to`. `page_table` must be a valid physical address.
+    pub fn cpu_switch_to_with_pt(old: *mut CpuContext, new: *const CpuContext, page_table: usize);
 }
 
 // ─── AArch64 context switch ────────────────────────────────────────────────
@@ -234,14 +251,13 @@ core::arch::global_asm!(r#"
 cpu_switch_to:
     // x0 = *mut CpuContext (old)
     // x1 = *const CpuContext (new)
-    //
-    // CpuContext layout (AArch64):
-    //   Bytes   0.. 88: gregs[0..11] (x19-x30, 12 × u64)
-    //   Byte       96:  sp            (u64)
-    //   Byte      104:  _pad          (u64, alignment padding)
-    //   Bytes 112..623: fpregs[0..31] (Q0-Q31, 32 × u128 = 512 bytes, 16-byte aligned)
-    //   Byte      624:  fpcr          (u64)
-    //   Byte      632:  fpsr          (u64)
+
+    // Debug: Direct UART write 'A' to show we entered cpu_switch_to
+    stp  x0, x1, [sp, #-16]!
+    mov  x0, #'A'
+    mov  x1, #0x09000000
+    str  w0, [x1]
+    ldp  x0, x1, [sp], #16
 
     // ── save outgoing integer registers ─────────────────────────────────────
     stp  x19, x20, [x0, #0]
@@ -253,33 +269,41 @@ cpu_switch_to:
     mov  x9,  sp
     str  x9,  [x0, #96]
 
-    // ── save outgoing FP/SIMD registers ─────────────────────────────────────
-    add  x9, x0, #112            // x9 → fpregs[0] (16-byte aligned)
-    stp  q0,  q1,  [x9, #0]
-    stp  q2,  q3,  [x9, #32]
-    stp  q4,  q5,  [x9, #64]
-    stp  q6,  q7,  [x9, #96]
-    stp  q8,  q9,  [x9, #128]
-    stp  q10, q11, [x9, #160]
-    stp  q12, q13, [x9, #192]
-    stp  q14, q15, [x9, #224]
-    stp  q16, q17, [x9, #256]
-    stp  q18, q19, [x9, #288]
-    stp  q20, q21, [x9, #320]
-    stp  q22, q23, [x9, #352]
-    stp  q24, q25, [x9, #384]
-    stp  q26, q27, [x9, #416]
-    stp  q28, q29, [x9, #448]
-    stp  q30, q31, [x9, #480]
-    mrs  x10, fpcr
-    str  x10, [x0, #624]
+    // ── save outgoing FP/SIMD state ─────────────────────────────────────────
+    mrs  x9,  fpcr
     mrs  x10, fpsr
-    str  x10, [x0, #632]
-    // Save user-space TLS pointer (TPIDR_EL0) — offset 640.
+    str  x9,  [x0, #624]        // fpcr
+    str  x10, [x0, #632]        // fpsr
+
+    stp  q0,  q1,  [x0, #112]
+    stp  q2,  q3,  [x0, #144]
+    stp  q4,  q5,  [x0, #176]
+    stp  q6,  q7,  [x0, #208]
+    stp  q8,  q9,  [x0, #240]
+    stp  q10, q11, [x0, #272]
+    stp  q12, q13, [x0, #304]
+    stp  q14, q15, [x0, #336]
+    stp  q16, q17, [x0, #368]
+    stp  q18, q19, [x0, #400]
+    stp  q20, q21, [x0, #432]
+    stp  q22, q23, [x0, #464]
+    stp  q24, q25, [x0, #496]
+    stp  q26, q27, [x0, #528]
+    stp  q28, q29, [x0, #560]
+    stp  q30, q31, [x0, #592]
+
+    // save TLS register
     mrs  x10, tpidr_el0
     str  x10, [x0, #640]
 
-    // ── restore incoming integer registers ───────────────────────────────────
+    // Debug: Direct UART write 'B' to show we finished saving
+    stp  x0, x1, [sp, #-16]!
+    mov  x0, #'B'
+    mov  x1, #0x09000000
+    str  w0, [x1]
+    ldp  x0, x1, [sp], #16
+
+    // ── restore incoming integer registers ──────────────────────────────────
     ldp  x19, x20, [x1, #0]
     ldp  x21, x22, [x1, #16]
     ldp  x23, x24, [x1, #32]
@@ -289,31 +313,150 @@ cpu_switch_to:
     ldr  x9,  [x1, #96]
     mov  sp,  x9
 
-    // ── restore incoming FP/SIMD registers ───────────────────────────────────
-    add  x9, x1, #112            // x9 → fpregs[0] (16-byte aligned)
-    ldp  q0,  q1,  [x9, #0]
-    ldp  q2,  q3,  [x9, #32]
-    ldp  q4,  q5,  [x9, #64]
-    ldp  q6,  q7,  [x9, #96]
-    ldp  q8,  q9,  [x9, #128]
-    ldp  q10, q11, [x9, #160]
-    ldp  q12, q13, [x9, #192]
-    ldp  q14, q15, [x9, #224]
-    ldp  q16, q17, [x9, #256]
-    ldp  q18, q19, [x9, #288]
-    ldp  q20, q21, [x9, #320]
-    ldp  q22, q23, [x9, #352]
-    ldp  q24, q25, [x9, #384]
-    ldp  q26, q27, [x9, #416]
-    ldp  q28, q29, [x9, #448]
-    ldp  q30, q31, [x9, #480]
-    ldr  x10, [x1, #624]
-    msr  fpcr, x10
-    ldr  x10, [x1, #632]
+    // ── restore incoming FP/SIMD state ──────────────────────────────────────
+    ldr  x9,  [x1, #624]        // fpcr
+    ldr  x10, [x1, #632]        // fpsr
+    msr  fpcr, x9
     msr  fpsr, x10
-    // Restore user-space TLS pointer (TPIDR_EL0) — offset 640.
+
+    ldp  q0,  q1,  [x1, #112]
+    ldp  q2,  q3,  [x1, #144]
+    ldp  q4,  q5,  [x1, #176]
+    ldp  q6,  q7,  [x1, #208]
+    ldp  q8,  q9,  [x1, #240]
+    ldp  q10, q11, [x1, #272]
+    ldp  q12, q13, [x1, #304]
+    ldp  q14, q15, [x1, #336]
+    ldp  q16, q17, [x1, #368]
+    ldp  q18, q19, [x1, #400]
+    ldp  q20, q21, [x1, #432]
+    ldp  q22, q23, [x1, #464]
+    ldp  q24, q25, [x1, #496]
+    ldp  q26, q27, [x1, #528]
+    ldp  q28, q29, [x1, #560]
+    ldp  q30, q31, [x1, #592]
+
+    // restore TLS register
     ldr  x10, [x1, #640]
     msr  tpidr_el0, x10
+
+    // Debug: Direct UART write 'C' to show we're about to ret
+    stp  x0, x1, [sp, #-16]!
+    mov  x0, #'C'
+    mov  x1, #0x09000000
+    str  w0, [x1]
+    ldp  x0, x1, [sp], #16
+
+    ret                          // branch to x30
+
+// ─── AArch64 context switch with page table switch ────────────────────────────
+.global cpu_switch_to_with_pt
+.type   cpu_switch_to_with_pt, %function
+cpu_switch_to_with_pt:
+    // x0 = *mut CpuContext (old)
+    // x1 = *const CpuContext (new)
+    // x2 = page_table (physical address, 0 = no change)
+
+    // Debug: Direct UART write 'D' to show we entered cpu_switch_to_with_pt
+    stp  x0, x1, [sp, #-16]!
+    mov  x0, #'D'
+    mov  x1, #0x09000000
+    str  w0, [x1]
+    ldp  x0, x1, [sp], #16
+
+    // ── save outgoing integer registers ─────────────────────────────────────
+    stp  x19, x20, [x0, #0]
+    stp  x21, x22, [x0, #16]
+    stp  x23, x24, [x0, #32]
+    stp  x25, x26, [x0, #48]
+    stp  x27, x28, [x0, #64]
+    stp  x29, x30, [x0, #80]    // fp (x29) and lr (x30)
+    mov  x9,  sp
+    str  x9,  [x0, #96]
+
+    // ── save outgoing FP/SIMD state ─────────────────────────────────────────
+    mrs  x9,  fpcr
+    mrs  x10, fpsr
+    str  x9,  [x0, #624]        // fpcr
+    str  x10, [x0, #632]        // fpsr
+
+    stp  q0,  q1,  [x0, #112]
+    stp  q2,  q3,  [x0, #144]
+    stp  q4,  q5,  [x0, #176]
+    stp  q6,  q7,  [x0, #208]
+    stp  q8,  q9,  [x0, #240]
+    stp  q10, q11, [x0, #272]
+    stp  q12, q13, [x0, #304]
+    stp  q14, q15, [x0, #336]
+    stp  q16, q17, [x0, #368]
+    stp  q18, q19, [x0, #400]
+    stp  q20, q21, [x0, #432]
+    stp  q22, q23, [x0, #464]
+    stp  q24, q25, [x0, #496]
+    stp  q26, q27, [x0, #528]
+    stp  q28, q29, [x0, #560]
+    stp  q30, q31, [x0, #592]
+
+    // save TLS register
+    mrs  x10, tpidr_el0
+    str  x10, [x0, #640]
+
+    // ── switch page table if needed ─────────────────────────────────────────
+    // Debug: Direct UART write 'P' before page table switch
+    stp  x0, x1, [sp, #-16]!
+    mov  x0, #'P'
+    mov  x1, #0x09000000
+    str  w0, [x1]
+    ldp  x0, x1, [sp], #16
+
+    cbz  x2, 1f                 // if page_table == 0, skip page table switch
+    msr  ttbr0_el1, x2          // switch to new page table
+    isb                         // ensure page table switch is complete
+1:
+
+    // ── restore incoming integer registers ──────────────────────────────────
+    ldp  x19, x20, [x1, #0]
+    ldp  x21, x22, [x1, #16]
+    ldp  x23, x24, [x1, #32]
+    ldp  x25, x26, [x1, #48]
+    ldp  x27, x28, [x1, #64]
+    ldp  x29, x30, [x1, #80]    // x30 = return addr or entry point
+    ldr  x9,  [x1, #96]
+    mov  sp,  x9
+
+    // ── restore incoming FP/SIMD state ──────────────────────────────────────
+    ldr  x9,  [x1, #624]        // fpcr
+    ldr  x10, [x1, #632]        // fpsr
+    msr  fpcr, x9
+    msr  fpsr, x10
+
+    ldp  q0,  q1,  [x1, #112]
+    ldp  q2,  q3,  [x1, #144]
+    ldp  q4,  q5,  [x1, #176]
+    ldp  q6,  q7,  [x1, #208]
+    ldp  q8,  q9,  [x1, #240]
+    ldp  q10, q11, [x1, #272]
+    ldp  q12, q13, [x1, #304]
+    ldp  q14, q15, [x1, #336]
+    ldp  q16, q17, [x1, #368]
+    ldp  q18, q19, [x1, #400]
+    ldp  q20, q21, [x1, #432]
+    ldp  q22, q23, [x1, #464]
+    ldp  q24, q25, [x1, #496]
+    ldp  q26, q27, [x1, #528]
+    ldp  q28, q29, [x1, #560]
+    ldp  q30, q31, [x1, #592]
+
+    // restore TLS register
+    ldr  x10, [x1, #640]
+    msr  tpidr_el0, x10
+
+    // Debug: Direct UART write 'R' before ret (which jumps to ret_to_user)
+    stp  x0, x1, [sp, #-16]!
+    mov  x0, #'R'
+    mov  x1, #0x09000000
+    str  w0, [x1]
+    ldp  x0, x1, [sp], #16
 
     ret                          // branch to x30
 "#);
