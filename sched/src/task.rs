@@ -1,7 +1,6 @@
 //! Task (process/thread) descriptor — analogous to Linux `task_struct`.
 
 extern crate alloc;
-use alloc::alloc::{alloc_zeroed, Layout};
 
 use crate::context::CpuContext;
 use mm::vmm::AddressSpace;
@@ -105,183 +104,54 @@ impl Task {
         stack_size: usize,
         page_table: usize,
     ) -> alloc::boxed::Box<Self> {
-        // Use buddy allocator approach directly to avoid any stack operations
-        unsafe {
-            let task_size = core::mem::size_of::<Task>();
-            let page_size = mm::buddy::PAGE_SIZE;
-
-            let order = {
-                let mut o = 0;
-                let mut size = page_size;
-                while size < task_size {
-                    size *= 2;
-                    o += 1;
-                }
-                o
-            };
-
-            let ptr = match mm::buddy::alloc(order) {
-                Some(addr) => {
-                    // Debug task allocation address
-                    extern "C" { fn arch_serial_putc(b: u8); }
-                    let task_alloc_msg = b"Task allocated at: 0x";
-                    for &b in task_alloc_msg { arch_serial_putc(b); }
-                    for i in (0..16).rev() {
-                        let nibble = ((addr >> (i * 4)) & 0xF) as u8;
-                        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-                        arch_serial_putc(ch);
-                    }
-                    let newline = b"\r\n";
-                    for &b in newline { arch_serial_putc(b); }
-
-                    addr as *mut Task
-                }
-                None => panic!("Failed to allocate Task struct"),
-            };
-
-            // Zero the memory
-            core::ptr::write_bytes(ptr as *mut u8, 0, task_size);
-
-            // Initialize in-place
-            Self::new_kernel_inplace(ptr, pid, entry, stack_base, stack_size, page_table);
-
-            // Convert directly to Box without copying to stack
-            alloc::boxed::Box::from_raw(ptr)
-        }
-    }
-
-    pub fn new_kernel_old(
-        pid:        Pid,
-        entry:      usize,
-        stack_base: usize,
-        stack_size: usize,
-        page_table: usize,
-    ) -> alloc::boxed::Box<Self> {
         extern "C" { fn arch_serial_putc(b: u8); }
-        let msg = b"Task::new_kernel: direct heap allocation approach\r\n";
-        for &b in msg { unsafe { arch_serial_putc(b); } }
+        let msg_direct = b"Task::new_kernel: using clean Box::new allocation\r\n";
+        for &b in msg_direct { unsafe { arch_serial_putc(b); } }
 
-        let msg2 = b"Task::new_kernel: bypassing MaybeUninit entirely\r\n";
-        for &b in msg2 { unsafe { arch_serial_putc(b); } }
+        // Create task struct directly using Box::new for clean, single allocation
+        let temp_task = Task {
+            pid,
+            state: TaskState::Ready,
+            priority: 0,
+            ctx: if entry == 0 {
+                CpuContext::zeroed()
+            } else {
+                CpuContext::new_task(entry, stack_base + stack_size)
+            },
+            page_table,
+            kernel_stack: stack_base,
+            blocked_on: None,
+            blocked_futex: 0,
+            address_space: None,
+            exit_code: 0,
+            reply_port: u32::MAX,
+            ppid: 0,
+            tgid: pid,
+            pgid: pid,
+            sid: pid,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+            signal_pending: 0,
+            signal_mask: 0,
+            signal_actions: [DEFAULT_SIGACTION; 4],
+            clear_child_tid: 0,
+            heap_start: 0,
+            heap_end: 0,
+            tls_base: 0,
+            cwd: [0; 32],
+            cwd_len: 0,
+            umask: 0o022,
+        };
 
-        unsafe {
-            // Use buddy allocator to completely avoid stack operations
-            let task_size = core::mem::size_of::<Task>();
-            let page_size = mm::buddy::PAGE_SIZE;
+        let msg_done = b"Task::new_kernel: task ready with clean allocation\r\n";
+        for &b in msg_done { unsafe { arch_serial_putc(b); } }
 
-            // Calculate buddy allocator order
-            let order = {
-                let mut o = 0;
-                let mut size = page_size;
-                while size < task_size {
-                    size *= 2;
-                    o += 1;
-                }
-                o
-            };
-
-            // Debug output about allocation
-            let msg_debug = b"Task::new_kernel: size=";
-            for &b in msg_debug { arch_serial_putc(b); }
-
-            // Print task_size as hex
-            let mut n = task_size;
-            for i in (0..8).rev() {
-                let digit = ((n >> (i * 4)) & 0xF) as u8;
-                let c = if digit < 10 { b'0' + digit } else { b'a' + digit - 10 };
-                arch_serial_putc(c);
-            }
-
-            let msg_order = b" order=";
-            for &b in msg_order { arch_serial_putc(b); }
-            arch_serial_putc(b'0' + order as u8);
-            arch_serial_putc(b'\r');
-            arch_serial_putc(b'\n');
-
-            let msg_buddy = b"Task::new_kernel: using buddy allocator completely\r\n";
-            for &b in msg_buddy { arch_serial_putc(b); }
-
-            // Allocate memory using buddy allocator
-            let ptr = match mm::buddy::alloc(order) {
-                Some(addr) => {
-                    let msg_alloc = b"Task::new_kernel: allocation succeeded addr=";
-                    for &b in msg_alloc { arch_serial_putc(b); }
-
-                    // Print address as hex
-                    let mut n = addr;
-                    for i in (0..8).rev() {
-                        let digit = ((n >> (i * 4)) & 0xF) as u8;
-                        let c = if digit < 10 { b'0' + digit } else { b'a' + digit - 10 };
-                        arch_serial_putc(c);
-                    }
-                    arch_serial_putc(b'\r');
-                    arch_serial_putc(b'\n');
-
-                    addr as *mut Task
-                }
-                None => {
-                    let msg_fail = b"Task::new_kernel: allocation failed, order=";
-                    for &b in msg_fail { arch_serial_putc(b); }
-                    arch_serial_putc(b'0' + order as u8);
-                    arch_serial_putc(b'\r');
-                    arch_serial_putc(b'\n');
-                    panic!("Failed to allocate Task struct");
-                }
-            };
-
-            let msg_zero = b"Task::new_kernel: skipping memory zero for test\r\n";
-            for &b in msg_zero { arch_serial_putc(b); }
-
-            // Skip zeroing for now to test if that's the issue
-            // core::ptr::write_bytes(ptr as *mut u8, 0, task_size);
-
-            let msg_allocated = b"Task::new_kernel: memory ready (not zeroed)\r\n";
-            for &b in msg_allocated { arch_serial_putc(b); }
-
-            let msg_inplace = b"Task::new_kernel: about to call new_kernel_inplace\r\n";
-            for &b in msg_inplace { arch_serial_putc(b); }
-
-            // Initialize in-place using our working method
-            Self::new_kernel_inplace(ptr, pid, entry, stack_base, stack_size, page_table);
-
-            let msg_inplace = b"Task::new_kernel: in-place initialization complete\r\n";
-            for &b in msg_inplace { arch_serial_putc(b); }
-
-            // Convert to Box using from_raw (since we allocated with buddy allocator)
-            // We can't use Box::from_raw here since it expects heap allocator memory
-            // Instead, we'll create a wrapper that manages the memory properly
-
-            // For now, just return the pointer wrapped in a way that works with RunQueue
-            // This is a temporary solution - we need to handle deallocation properly later
-            let task_ref = &*ptr;
-
-            // Try allocating with the slab allocator through the global allocator
-            let layout = alloc::alloc::Layout::new::<Task>();
-            let slab_ptr = alloc::alloc::alloc(layout) as *mut Task;
-
-            if slab_ptr.is_null() {
-                let msg_fallback = b"Task::new_kernel: slab failed, keeping buddy allocation\r\n";
-                for &b in msg_fallback { arch_serial_putc(b); }
-                // Convert buddy allocation directly to Box using from_raw (unsafe but necessary)
-                return alloc::boxed::Box::from_raw(ptr);
-            }
-
-            let msg_slab = b"Task::new_kernel: slab allocation succeeded, copying\r\n";
-            for &b in msg_slab { arch_serial_putc(b); }
-
-            // Copy from buddy allocation to slab allocation (no stack involved)
-            core::ptr::copy_nonoverlapping(ptr, slab_ptr, 1);
-
-            // Free buddy allocation
-            mm::buddy::free(ptr as usize, order);
-
-            let msg_done = b"Task::new_kernel: task ready with slab allocation\r\n";
-            for &b in msg_done { arch_serial_putc(b); }
-
-            // Convert slab allocation to Box
-            alloc::boxed::Box::from_raw(slab_ptr)
-        }
+        // Move to heap using Box::new (clean, single allocation)
+        alloc::boxed::Box::new(temp_task)
     }
+
 
     /// Create a kernel-mode task directly in the provided memory location.
     /// This avoids large struct moves that can cause stack overflows.
@@ -316,7 +186,7 @@ impl Task {
         let test_msg = b"Task::new_kernel_inplace: testing read access\r\n";
         for &b in test_msg { arch_serial_putc(b); }
 
-        let test_byte = unsafe { core::ptr::read_volatile(dest as *const u8) };
+        let _test_byte = unsafe { core::ptr::read_volatile(dest as *const u8) };
 
         let success_msg = b"Task::new_kernel_inplace: read succeeded, about to write pid\r\n";
         for &b in success_msg { arch_serial_putc(b); }
@@ -357,11 +227,11 @@ impl Task {
         let debug_msg = b"Task::new_kernel_inplace: calling memory debug\r\n";
         for &b in debug_msg { arch_serial_putc(b); }
 
-        // This is currently a standalone build - call debug via external declaration
-        extern "C" {
-            fn debug_memory_attributes_aarch64(addr: usize);
-        }
-        debug_memory_attributes_aarch64(dest as usize);
+        // DISABLED: This was causing race conditions in the page table walking code
+        // extern "C" {
+        //     fn debug_memory_attributes_aarch64(addr: usize);
+        // }
+        // debug_memory_attributes_aarch64(dest as usize);
 
         // Initialize critical fields
         let init_msg = b"Task::new_kernel_inplace: initializing fields\r\n";
@@ -523,6 +393,62 @@ impl Task {
         for &b in msg2 { arch_serial_putc(b); }
     }
 
+    /// Create a userspace task that transitions directly to userspace
+    pub fn new_userspace(
+        pid: Pid,
+        user_entry: usize,
+        user_sp: usize,
+        kernel_stack_base: usize,
+        kernel_stack_size: usize,
+        page_table: usize,
+    ) -> alloc::boxed::Box<Self> {
+        extern "C" { fn arch_serial_putc(b: u8); }
+        let debug_msg = b"Task::new_userspace: creating userspace task\r\n";
+        for &b in debug_msg { unsafe { arch_serial_putc(b); } }
+
+        unsafe {
+            let task_size = core::mem::size_of::<Task>();
+            let page_size = mm::buddy::PAGE_SIZE;
+            let order = {
+                let mut o = 0;
+                let mut size = page_size;
+                while size < task_size {
+                    size *= 2;
+                    o += 1;
+                }
+                o
+            };
+
+            let ptr = mm::buddy::alloc(order).unwrap() as *mut Task;
+            core::ptr::write_bytes(ptr as *mut u8, 0, task_size);
+
+            // Set basic task fields
+            let pid_ptr = (ptr as usize + core::mem::offset_of!(Task, pid)) as *mut Pid;
+            core::ptr::write_volatile(pid_ptr, pid);
+
+            let state_ptr = (ptr as usize + core::mem::offset_of!(Task, state)) as *mut TaskState;
+            core::ptr::write_volatile(state_ptr, TaskState::Ready);
+
+            let page_table_ptr = (ptr as usize + core::mem::offset_of!(Task, page_table)) as *mut usize;
+            core::ptr::write_volatile(page_table_ptr, page_table);
+
+            let kernel_stack_ptr = (ptr as usize + core::mem::offset_of!(Task, kernel_stack)) as *mut usize;
+            core::ptr::write_volatile(kernel_stack_ptr, kernel_stack_base);
+
+            // Create userspace context directly
+            let kernel_stack_top = kernel_stack_base + kernel_stack_size;
+            let ctx = crate::context::CpuContext::new_user_task(user_entry, user_sp, kernel_stack_top);
+
+            let ctx_ptr = (ptr as usize + core::mem::offset_of!(Task, ctx)) as *mut crate::context::CpuContext;
+            core::ptr::write_volatile(ctx_ptr, ctx);
+
+            let success_msg = b"Task::new_userspace: userspace task created successfully\r\n";
+            for &b in success_msg { arch_serial_putc(b); }
+
+            alloc::boxed::Box::from_raw(ptr)
+        }
+    }
+
     /// Create a minimal test task using unsafe initialization to avoid stack issues.
     /// This proves the scheduler core functionality works.
     pub fn new_minimal_test(pid: Pid, entry: usize, stack_base: usize, stack_size: usize) -> Self {
@@ -534,7 +460,7 @@ impl Task {
         let task_size = core::mem::size_of::<Task>();
         let msg_debug = b"Task size now: ";
         for &b in msg_debug { unsafe { arch_serial_putc(b); } }
-        let mut n = task_size;
+        let n = task_size;
         for i in (0..8).rev() {
             let digit = ((n >> (i * 4)) & 0xF) as u8;
             let c = if digit < 10 { b'0' + digit } else { b'a' + digit - 10 };
@@ -543,7 +469,7 @@ impl Task {
         let msg_end = b"\r\n";
         for &b in msg_end { unsafe { arch_serial_putc(b); } }
 
-        let stack_top = stack_base + stack_size;
+        let _stack_top = stack_base + stack_size;
 
         // Use the buddy allocator approach since it was working correctly
         // when the memory regions were fixed
