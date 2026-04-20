@@ -33,12 +33,152 @@ pub unsafe extern "C" fn arch_set_kernel_stack(kst: u64) {
 /// Install VBAR_EL1 pointing at our vector table.
 pub fn init() {
     unsafe {
+        extern "C" { fn arch_serial_putc(ch: u8); }
+
+        // Debug: Print what we're setting VBAR_EL1 to
+        let vector_addr: u64;
+        core::arch::asm!(
+            "adr {}, __exception_vectors",
+            out(reg) vector_addr,
+            options(nostack)
+        );
+
+        let debug_msg = b"[EXCEPTION] Setting VBAR_EL1 to: 0x";
+        for &b in debug_msg { arch_serial_putc(b); }
+        for shift in (0..16).rev() {
+            let nibble = (vector_addr >> (shift * 4)) & 0xF;
+            let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+            arch_serial_putc(ch);
+        }
+        let debug_nl = b"\r\n";
+        for &b in debug_nl { arch_serial_putc(b); }
+
+        // Debug: Check current exception level and system registers
+        let current_el: u64;
+        core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el);
+        let el_level = (current_el >> 2) & 0x3;
+
+        let debug_el = b"[EXCEPTION] Running at exception level: EL";
+        for &b in debug_el { arch_serial_putc(b); }
+        arch_serial_putc(b'0' + el_level as u8);
+        for &b in debug_nl { arch_serial_putc(b); }
+
+        // Check DAIF (interrupt masks) - these might be blocking exceptions
+        let daif: u64;
+        core::arch::asm!("mrs {}, DAIF", out(reg) daif);
+        let debug_daif = b"[EXCEPTION] DAIF register: 0x";
+        for &b in debug_daif { arch_serial_putc(b); }
+        for shift in (0..2).rev() {
+            let nibble = (daif >> (shift * 4)) & 0xF;
+            let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+            arch_serial_putc(ch);
+        }
+        for &b in debug_nl { arch_serial_putc(b); }
+
         core::arch::asm!(
             "adr x0, __exception_vectors",
             "msr VBAR_EL1, x0",
             "isb",
             options(nostack)
         );
+
+        // Debug: Read back VBAR_EL1 to verify it was set
+        let vbar_readback: u64;
+        core::arch::asm!(
+            "mrs {}, VBAR_EL1",
+            out(reg) vbar_readback,
+            options(nostack)
+        );
+
+        let debug_readback = b"[EXCEPTION] VBAR_EL1 readback: 0x";
+        for &b in debug_readback { arch_serial_putc(b); }
+        for shift in (0..16).rev() {
+            let nibble = (vbar_readback >> (shift * 4)) & 0xF;
+            let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+            arch_serial_putc(ch);
+        }
+        let debug_nl2 = b"\r\n";
+        for &b in debug_nl2 { arch_serial_putc(b); }
+
+        if vector_addr == vbar_readback {
+            let debug_ok = b"[EXCEPTION] VBAR_EL1 setup SUCCESS!\r\n";
+            for &b in debug_ok { arch_serial_putc(b); }
+        } else {
+            let debug_fail = b"[EXCEPTION] VBAR_EL1 setup FAILED!\r\n";
+            for &b in debug_fail { arch_serial_putc(b); }
+        }
+
+        // Debug: Check the actual memory contents at the exception vector table
+        let debug_vector_mem = b"[EXCEPTION] Vector table memory at 0x";
+        for &b in debug_vector_mem { arch_serial_putc(b); }
+        for shift in (0..16).rev() {
+            let nibble = (vector_addr >> (shift * 4)) & 0xF;
+            let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+            arch_serial_putc(ch);
+        }
+        let debug_colon = b":\r\n";
+        for &b in debug_colon { arch_serial_putc(b); }
+
+        // Read first 32 bytes of exception vector table and display as hex
+        let vec_ptr = vector_addr as *const u32;
+        for i in 0..8 {
+            let word = vec_ptr.add(i).read_volatile();
+            let debug_word = b"  0x";
+            for &b in debug_word { arch_serial_putc(b); }
+            for shift in (0..8).rev() {
+                let nibble = (word >> (shift * 4)) & 0xF;
+                let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+                arch_serial_putc(ch);
+            }
+            if i % 2 == 1 {
+                let debug_nl = b"\r\n";
+                for &b in debug_nl { arch_serial_putc(b); }
+            } else {
+                arch_serial_putc(b' ');
+            }
+        }
+
+        // Check EL1h Sync vector at offset 0x200 (critical for undefined instruction)
+        let debug_el1_msg = b"[EXCEPTION] EL1h Sync vector at offset 0x200:\r\n";
+        for &b in debug_el1_msg { arch_serial_putc(b); }
+        let el1_sync_ptr = (vector_addr + 0x200) as *const u32;
+        for i in 0..4 {
+            let word = el1_sync_ptr.add(i).read_volatile();
+            let debug_word = b"  0x";
+            for &b in debug_word { arch_serial_putc(b); }
+            for shift in (0..8).rev() {
+                let nibble = (word >> (shift * 4)) & 0xF;
+                let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+                arch_serial_putc(ch);
+            }
+            if i % 2 == 1 {
+                let debug_nl = b"\r\n";
+                for &b in debug_nl { arch_serial_putc(b); }
+            } else {
+                arch_serial_putc(b' ');
+            }
+        }
+
+        // Also check EL0 Sync vector at offset 0x400 (critical for svc #0)
+        let debug_el0_msg = b"[EXCEPTION] EL0 Sync vector at offset 0x400:\r\n";
+        for &b in debug_el0_msg { arch_serial_putc(b); }
+        let el0_sync_ptr = (vector_addr + 0x400) as *const u32;
+        for i in 0..4 {
+            let word = el0_sync_ptr.add(i).read_volatile();
+            let debug_word = b"  0x";
+            for &b in debug_word { arch_serial_putc(b); }
+            for shift in (0..8).rev() {
+                let nibble = (word >> (shift * 4)) & 0xF;
+                let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+                arch_serial_putc(ch);
+            }
+            if i % 2 == 1 {
+                let debug_nl = b"\r\n";
+                for &b in debug_nl { arch_serial_putc(b); }
+            } else {
+                arch_serial_putc(b' ');
+            }
+        }
     }
 }
 
@@ -50,53 +190,209 @@ core::arch::global_asm!(r#"
 .global __exception_vectors
 __exception_vectors:
     // EL1t Sync  (SP_EL0) — 0x000
-    b exc_el1_sync
+    ldr x9, =exc_el1_sync
+    br x9
     .balign 128
     // EL1t IRQ
-    b exc_irq
+    ldr x9, =exc_irq
+    br x9
     .balign 128
     // EL1t FIQ
-    b exc_unexpected
+    ldr x9, =exc_unexpected
+    br x9
     .balign 128
     // EL1t SError
-    b exc_unexpected
+    ldr x9, =exc_unexpected
+    br x9
     .balign 128
 
     // EL1h Sync  (SP_EL1) — 0x200
-    b exc_el1_sync
+    b exc_el1_sync_nearby
     .balign 128
     // EL1h IRQ   — 0x280
-    b exc_irq
+    ldr x9, =exc_irq
+    br x9
     .balign 128
     // EL1h FIQ
-    b exc_unexpected
+    ldr x9, =exc_unexpected
+    br x9
     .balign 128
     // EL1h SError
-    b exc_unexpected
+    ldr x9, =exc_unexpected
+    br x9
     .balign 128
 
     // EL0-64 Sync — 0x400
-    b exc_el0_sync
+    ldr x9, =exc_el0_sync_impl
+    br x9
     .balign 128
     // EL0-64 IRQ
-    b exc_el0_irq
+    ldr x9, =exc_el0_irq
+    br x9
     .balign 128
     // EL0-64 FIQ
-    b exc_unexpected
+    ldr x9, =exc_unexpected
+    br x9
     .balign 128
     // EL0-64 SError
-    b exc_unexpected
+    ldr x9, =exc_unexpected
+    br x9
     .balign 128
 
     // EL0-32 (AArch32) — 0x600 — not supported
-    b exc_unexpected
+    ldr x9, =exc_unexpected
+    br x9
     .balign 128
-    b exc_unexpected
+    ldr x9, =exc_unexpected
+    br x9
     .balign 128
-    b exc_unexpected
+    ldr x9, =exc_unexpected
+    br x9
     .balign 128
-    b exc_unexpected
+    ldr x9, =exc_unexpected
+    br x9
     .balign 128
+
+// ── Exception handlers (placed immediately after vectors for direct branch) ──
+// At this point we should be at offset 0x800 from vector table base
+
+exc_el1_sync_nearby:
+    // Save x0 first
+    stp  x0, x1, [sp, #-16]!
+
+    // DEBUG: Print character directly to UART to show we entered exc_el1_sync
+    mov  x0, #'Y'  // Y for EL1 sync
+    mov  x1, #0x09000000  // QEMU virt UART base address
+    str  w0, [x1]  // Write directly to UART data register
+
+    // Skip the undefined instruction by advancing ELR_EL1 by 4 bytes
+    mrs  x0, elr_el1
+    add  x0, x0, #4
+    msr  elr_el1, x0
+
+    // Restore x0, x1
+    ldp  x0, x1, [sp], #16
+
+    // Return from exception
+    eret
+
+
+exc_irq_nearby:
+    // DEBUG: Print character to show we entered exc_irq
+    mov  x9, #'J'  // J for IRQ
+    bl   arch_serial_putc
+    bl   irq_dispatch
+    b .
+
+exc_el0_irq_nearby:
+    // DEBUG: Print character to show we entered exc_el0_irq
+    mov  x9, #'I'  // I for IRQ
+    bl   arch_serial_putc
+    b .
+
+exc_unexpected_nearby:
+    // DEBUG: Print character to show we entered exc_unexpected
+    mov  x9, #'U'  // U for unexpected
+    bl   arch_serial_putc
+    b .
+
+// ── EL0 sync handler (syscalls and faults from userspace) ───────────────────
+exc_el0_sync_impl:
+    // DEBUG: Print 'E' to show we entered EL0 sync handler
+    stp  x0, x1, [sp, #-16]!  // Save x0, x1 first
+    mov  x0, #'E'
+    mov  x1, #0x09000000
+    str  w0, [x1]
+    ldp  x0, x1, [sp], #16    // Restore x0, x1
+
+    // Save all registers for syscall/fault handling
+    stp  x0,  x1,  [sp, #-16]!
+    stp  x2,  x3,  [sp, #-16]!
+    stp  x4,  x5,  [sp, #-16]!
+    stp  x6,  x7,  [sp, #-16]!
+    stp  x8,  x9,  [sp, #-16]!
+    stp  x10, x11, [sp, #-16]!
+    stp  x12, x13, [sp, #-16]!
+    stp  x14, x15, [sp, #-16]!
+    stp  x16, x17, [sp, #-16]!
+    stp  x18, x19, [sp, #-16]!
+    stp  x20, x21, [sp, #-16]!
+    stp  x22, x23, [sp, #-16]!
+    stp  x24, x25, [sp, #-16]!
+    stp  x26, x27, [sp, #-16]!
+    stp  x28, x29, [sp, #-16]!
+    str  x30,      [sp, #-8]!
+
+    // Check ESR_EL1 to determine exception type
+    mrs  x0, esr_el1
+    mrs  x1, elr_el1
+
+    // Extract Exception Class (EC) from ESR_EL1[31:26]
+    lsr  x2, x0, #26
+    and  x2, x2, #0x3F
+
+    // Check if it's SVC (exception class 0x15 = 21)
+    cmp  x2, #21
+    b.eq el0_syscall_handler
+
+    // Not a syscall - route to fault handler
+    bl   exc_el0_fault_handler
+    b    el0_sync_return
+
+el0_syscall_handler:
+    // DEBUG: Print 'S' to show we entered syscall handler
+    mov  x9, #'S'
+    mov  x10, #0x09000000
+    str  w9, [x10]
+
+    // Get syscall arguments from saved registers on stack
+    // Stack layout (from bottom to top): x0,x1 x2,x3 x4,x5 x6,x7 x8,x9 ...
+    ldr  x0, [sp, #120]  // x8 (syscall number) at offset 8*15 = 120
+    ldr  x1, [sp, #128]  // x0 (arg0) at offset 8*16 = 128
+    ldr  x2, [sp, #112]  // x2 (arg1) at offset 8*14 = 112
+    ldr  x3, [sp, #104]  // x3 (arg2) at offset 8*13 = 104
+    ldr  x4, [sp, #96]   // x4 (arg3) at offset 8*12 = 96
+    ldr  x5, [sp, #88]   // x5 (arg4) at offset 8*11 = 88
+    ldr  x6, [sp, #80]   // x6 (arg5) at offset 8*10 = 80
+    mov  x7, sp          // Frame pointer as last argument
+
+    // DEBUG: Print 'D' before calling syscall_dispatch
+    mov  x9, #'D'
+    mov  x10, #0x09000000
+    str  w9, [x10]
+
+    // Call syscall_dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr)
+    bl   syscall_dispatch
+
+    // DEBUG: Print 'R' after syscall_dispatch returns
+    mov  x9, #'R'
+    mov  x10, #0x09000000
+    str  w9, [x10]
+
+    // Store return value in saved x0 slot
+    str  x0, [sp, #128]
+
+el0_sync_return:
+    // Restore all registers in reverse order
+    ldr  x30,      [sp], #8
+    ldp  x28, x29, [sp], #16
+    ldp  x26, x27, [sp], #16
+    ldp  x24, x25, [sp], #16
+    ldp  x22, x23, [sp], #16
+    ldp  x20, x21, [sp], #16
+    ldp  x18, x19, [sp], #16
+    ldp  x16, x17, [sp], #16
+    ldp  x14, x15, [sp], #16
+    ldp  x12, x13, [sp], #16
+    ldp  x10, x11, [sp], #16
+    ldp  x8,  x9,  [sp], #16
+    ldp  x6,  x7,  [sp], #16
+    ldp  x4,  x5,  [sp], #16
+    ldp  x2,  x3,  [sp], #16
+    ldp  x0,  x1,  [sp], #16
+
+    // Return to userspace
+    eret
 
 // ── Macro: reload SP_EL1 from TPIDR_EL1 on EL0 entry ────────────────────────
 //
@@ -117,6 +413,10 @@ __exception_vectors:
 
 // ── EL0-64 IRQ — save caller-saved regs, reload KSP, dispatch, eret ──────────
 exc_el0_irq:
+    // DEBUG: Print character to show we entered exc_el0_irq
+    mov  x9, #'I'  // I for IRQ
+    bl   arch_serial_putc
+
     reload_kernel_sp
     stp  x29, x30, [sp, #-16]!
     stp  x0,  x1,  [sp, #-16]!
@@ -146,6 +446,10 @@ exc_el0_irq:
 // ── EL1h IRQ — save caller-saved regs, dispatch, restore, eret ───────────────
 // Does NOT reload the kernel SP (already on the correct EL1 stack).
 exc_irq:
+    // DEBUG: Print character to show we entered exc_irq
+    mov  x9, #'J'  // J for EL1 IRQ
+    bl   arch_serial_putc
+
     // Save all caller-saved registers (x0-x17, x29=fp, x30=lr).
     stp  x29, x30, [sp, #-16]!
     stp  x0,  x1,  [sp, #-16]!
@@ -174,6 +478,10 @@ exc_irq:
 
 // ── EL1h synchronous exception (kernel fault) ─────────────────────────────
 exc_el1_sync:
+    // DEBUG: Print character to show we entered exc_el1_sync
+    mov  x9, #'Y'  // Y for EL1 sync
+    bl   arch_serial_putc
+
     mrs  x0, esr_el1
     mrs  x1, elr_el1
     bl   exc_el1_sync_handler   // panics
@@ -206,6 +514,10 @@ exc_el1_sync:
 // syscall_dispatch receives 8 arguments:
 //   x0=number, x1=a0, x2=a1, x3=a2, x4=a3, x5=a4, x6=a5, x7=frame_ptr
 exc_el0_sync:
+    // IMMEDIATE DEBUG: Print character to show we entered exc_el0_sync
+    mov  x9, #'$'  // $ for exc_el0_sync (very distinctive!)
+    bl   arch_serial_putc
+
     reload_kernel_sp
     // Allocate UserFrame (272 bytes).
     sub  sp, sp, #272
@@ -308,6 +620,10 @@ exc_el0_return:
 
 // ── Unexpected exception ──────────────────────────────────────────────────
 exc_unexpected:
+    // DEBUG: Print character to show we entered exc_unexpected
+    mov  x9, #'U'  // U for unexpected
+    bl   arch_serial_putc
+
     mrs  x0, esr_el1
     mrs  x1, elr_el1
     bl   exc_unexpected_handler  // panics
@@ -315,21 +631,41 @@ exc_unexpected:
 // ── ret_to_user — first entry into a new user-space task ──────────────────
 //
 // Called via cpu_switch_to (x30 = ret_to_user in the task's CpuContext).
-// The kernel stack contains 3 words built by CpuContext::new_user_task:
+// The kernel stack contains 4 words built by CpuContext::new_user_task:
 //   [sp+0]:  SP_EL0   (user stack pointer)
 //   [sp+8]:  ELR_EL1  (user entry point)
 //   [sp+16]: SPSR_EL1 (0 = EL0t, all interrupts unmasked)
+//   [sp+24]: PAGE_TABLE (user page table root, set by scheduler)
 .global ret_to_user
 .type   ret_to_user, %function
 ret_to_user:
+    // Debug: Direct UART write to show we reached ret_to_user
+    mov  x0, #'R'
+    mov  x1, #0x09000000
+    str  w0, [x1]
+
+    // Load user context from stack
     ldr  x0, [sp], #8
     msr  sp_el0,   x0
+
     ldr  x0, [sp], #8
     msr  elr_el1,  x0
+
     ldr  x0, [sp], #8
     msr  spsr_el1, x0
-    dsb  sy
-    isb
+
+    // Load page table from stack frame and switch to it
+    ldr  x0, [sp], #8      // Load page table from 4th word
+    cbz  x0, 1f            // if page table is 0, skip switch
+    msr  ttbr0_el1, x0     // switch to user page table
+    isb                    // ensure page table switch completes
+1:
+
+    // Debug: Direct UART write before eret
+    mov  x0, #'!'
+    mov  x1, #0x09000000
+    str  w0, [x1]
+
     mov  x0, #0             // fork / spawn returns 0 in child / new task
     eret
 
@@ -625,6 +961,24 @@ unsafe fn print_hex_value(prefix: &[u8], value: u64) {
 /// path; if it declines (no matching lazy VMA) we kill the task.
 #[no_mangle]
 unsafe extern "C" fn exc_el0_fault_handler(esr: u64, elr: u64) {
+    // Debug: Print that we caught a userspace fault
+    let debug_fault = b"[DEBUG] EL0 fault! ESR=0x";
+    for &b in debug_fault { arch_serial_putc(b); }
+    for i in (0..16).rev() {
+        let nibble = ((esr >> (i * 4)) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        arch_serial_putc(ch);
+    }
+    let debug_elr = b" ELR=0x";
+    for &b in debug_elr { arch_serial_putc(b); }
+    for i in (0..16).rev() {
+        let nibble = ((elr >> (i * 4)) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        arch_serial_putc(ch);
+    }
+    let debug_newline = b"\r\n";
+    for &b in debug_newline { arch_serial_putc(b); }
+
     let ec = (esr >> 26) & 0x3F;  // Exception Class
 
     // Data Abort (0x24) or Instruction Abort (0x20) from EL0.
@@ -674,3 +1028,4 @@ pub unsafe extern "C" fn syscall_entry_aarch64(
     }
     syscall_dispatch(number, a0, a1, a2, a3, a4, a5, frame_ptr)
 }
+
