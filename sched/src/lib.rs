@@ -346,17 +346,72 @@ fn scheduler_run_loop() -> ! {
                             let stack_ptr = task_ctx.sp as *mut u64;
                             stack_ptr.add(3).write(page_table as u64);  // PAGE_TABLE at offset 3
 
-                            let msg = b"[SCHED] Page table stored in frame, calling cpu_switch_to\r\n";
+                            let msg = b"[SCHED] BYPASS: Direct userspace jump without cpu_switch_to\r\n";
                             for &b in msg { arch_serial_putc(b); }
 
-                            // Use normal context switch - ret_to_user will handle page table switch
-                            context::cpu_switch_to(
-                                core::ptr::addr_of_mut!(SCHEDULER_CTX[id]),
-                                ctx_ptr,
+                            // Read context values from the task's stack frame
+                            let task_ctx = &*ctx_ptr;
+                            let frame_ptr = task_ctx.sp as *const u64;
+                            let user_sp = unsafe { frame_ptr.add(0).read() } as usize;     // SP_EL0
+                            let user_entry = unsafe { frame_ptr.add(1).read() } as usize;  // ELR_EL1
+                            let spsr = unsafe { frame_ptr.add(2).read() };                 // SPSR_EL1
+
+                            let msg = b"[SCHED] Using ACTUAL context values: SP_EL0=0x";
+                            for &b in msg { arch_serial_putc(b); }
+                            for shift in (0..16).rev() {
+                                let nibble = (user_sp >> (shift * 4)) & 0xF;
+                                let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+                                arch_serial_putc(ch);
+                            }
+                            let msg = b" ELR_EL1=0x";
+                            for &b in msg { arch_serial_putc(b); }
+                            for shift in (0..16).rev() {
+                                let nibble = (user_entry >> (shift * 4)) & 0xF;
+                                let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+                                arch_serial_putc(ch);
+                            }
+                            let msg = b" SPSR_EL1=0x";
+                            for &b in msg { arch_serial_putc(b); }
+                            for shift in (0..16).rev() {
+                                let nibble = (spsr >> (shift * 4)) & 0xF;
+                                let ch = if nibble < 10 { b'0' + nibble as u8 } else { b'A' + (nibble - 10) as u8 };
+                                arch_serial_putc(ch);
+                            }
+                            let msg = b"\r\n";
+                            for &b in msg { arch_serial_putc(b); }
+
+                            let msg = b"[SCHED] Direct eret to userspace\r\n";
+                            for &b in msg { arch_serial_putc(b); }
+
+                            // Try a different approach: test minimal userspace execution first
+                            core::arch::asm!(
+                                // Set up userspace registers FIRST (like ret_to_user)
+                                "msr sp_el0, {user_sp}",
+                                "msr elr_el1, {user_entry}",
+                                "msr spsr_el1, {spsr}",
+
+                                // Then set up userspace page table (like ret_to_user)
+                                "msr ttbr0_el1, {page_table}",
+                                "isb",
+
+                                // Debug before eret
+                                "mov x9, #'@'",
+                                "mov x10, #0x09000000",
+                                "str w9, [x10]",
+
+                                // Return value
+                                "mov x0, #0",
+
+                                // Jump to userspace
+                                "eret",
+
+                                page_table = in(reg) page_table,
+                                user_sp = in(reg) user_sp,
+                                user_entry = in(reg) user_entry,
+                                spsr = in(reg) spsr,
+                                options(noreturn)
                             );
 
-                            let msg = b"[SCHED] Returned from cpu_switch_to\r\n";
-                            for &b in msg { arch_serial_putc(b); }
                         }
                     } else {
                         // For kernel tasks, use normal context switch
