@@ -81,20 +81,31 @@ pub unsafe fn enable_identity() {
     let l0_phys = core::ptr::addr_of!(ID_L0) as u64;
 
     // ── TCR_EL1 ──────────────────────────────────────────────────────────────
-    // T0SZ  = 16   → 48-bit VA space (2^48 bytes)
-    // TG0   = 00   → 4 KiB granule
-    // IRGN0 = 01   → inner write-back, read/write-allocate
-    // ORGN0 = 01   → outer write-back, read/write-allocate
-    // SH0   = 11   → inner-shareable
-    // EPD1  = 1    → disable TTBR1 walks (no kernel high-half yet)
+    // T0SZ  = 16   → 48-bit VA space (2^48 bytes) for TTBR0 (userspace)
+    // TG0   = 00   → 4 KiB granule for TTBR0
+    // IRGN0 = 01   → inner write-back, read/write-allocate for TTBR0
+    // ORGN0 = 01   → outer write-back, read/write-allocate for TTBR0
+    // SH0   = 11   → inner-shareable for TTBR0
+    // T1SZ  = 16   → 48-bit VA space (2^48 bytes) for TTBR1 (kernel)
+    // TG1   = 00   → 4 KiB granule for TTBR1
+    // IRGN1 = 01   → inner write-back, read/write-allocate for TTBR1
+    // ORGN1 = 01   → outer write-back, read/write-allocate for TTBR1
+    // SH1   = 11   → inner-shareable for TTBR1
+    // EPD0  = 0    → enable TTBR0 walks (userspace)
+    // EPD1  = 0    → enable TTBR1 walks (kernel) - FIXED!
     // IPS   = 010  → 40-bit intermediate PA (1 TiB).
     //                RPi 5 MMIO at ~66 GiB requires > 36 bits.
-    let tcr: u64 = 16
-        | (0b01  << 8)          // IRGN0
-        | (0b01  << 10)         // ORGN0
-        | (0b11  << 12)         // SH0
-        | (1     << 23)         // EPD1
-        | (0b010u64 << 32);     // IPS = 40-bit
+    let tcr: u64 = 16              // T0SZ
+        | (16u64 << 16)            // T1SZ
+        | (0b01  << 8)             // IRGN0
+        | (0b01  << 10)            // ORGN0
+        | (0b11  << 12)            // SH0
+        | (0b01  << 24)            // IRGN1
+        | (0b01  << 26)            // ORGN1
+        | (0b11  << 28)            // SH1
+        | (0     << 22)            // EPD0 = 0 (enable TTBR0)
+        | (0     << 23)            // EPD1 = 0 (enable TTBR1) - CRITICAL FIX
+        | (0b010u64 << 32);        // IPS = 40-bit
 
     // ── Activate ─────────────────────────────────────────────────────────────
 
@@ -102,6 +113,7 @@ pub unsafe fn enable_identity() {
     core::arch::asm!("isb", options(nostack, nomem));
 
     core::arch::asm!("msr TTBR0_EL1, {}", in(reg) l0_phys, options(nostack));
+    core::arch::asm!("msr TTBR1_EL1, {}", in(reg) l0_phys, options(nostack));  // Same identity mapping for kernel
     core::arch::asm!("isb", options(nostack, nomem));
 
     // Invalidate all EL1 TLB entries before enabling the MMU.
