@@ -292,8 +292,9 @@ exc_el0_irq_nearby:
 
 exc_unexpected_nearby:
     // DEBUG: Print character to show we entered exc_unexpected
-    mov  x9, #'U'  // U for unexpected
-    bl   arch_serial_putc
+    mov  x9, #'Y'  // Y for unexpected nearby
+    mov  x10, #0x09000000
+    str  w9, [x10]
     b .
 
 // ── EL0 sync handler (syscalls and faults from userspace) ───────────────────
@@ -621,8 +622,9 @@ exc_el0_return:
 // ── Unexpected exception ──────────────────────────────────────────────────
 exc_unexpected:
     // DEBUG: Print character to show we entered exc_unexpected
-    mov  x9, #'U'  // U for unexpected
-    bl   arch_serial_putc
+    mov  x9, #'X'  // X for unexpected (more distinctive)
+    mov  x10, #0x09000000
+    str  w9, [x10]
 
     mrs  x0, esr_el1
     mrs  x1, elr_el1
