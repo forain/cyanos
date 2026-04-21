@@ -195,6 +195,12 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
         }
         if ph.p_flags & PF_X != 0 {
             flags |= PageFlags::EXECUTE;
+            // DEBUG: Critical debug output
+            // This is ugly but necessary for debugging
+            let debug_msg = b"[ELF] EXECUTABLE segment detected! PF_X=1, setting EXECUTE flag\r\n";
+            for &byte in debug_msg {
+                unsafe { (0x09000000 as *mut u8).write(byte); }
+            }
         }
         // PF_R (read permission) is always granted; no separate flag needed.
 
@@ -228,6 +234,35 @@ pub fn load(bytes: &[u8], as_: &mut AddressSpace) -> Result<usize, ElfError> {
                     phys_base as *mut u8,
                     filesz,
                 );
+
+                // CRITICAL: Cache maintenance for executable code
+                // After copying code to memory, we must ensure cache coherency
+                if ph.p_flags & PF_X != 0 {
+                    // Clean data cache and invalidate instruction cache for the code region
+                    let start_addr = phys_base;
+                    let end_addr = phys_base + filesz;
+
+                    // AArch64 cache maintenance
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        // Clean data cache to point of coherency
+                        let mut addr = start_addr & !63; // Align to cache line (64 bytes)
+                        while addr < end_addr {
+                            core::arch::asm!("dc cvac, {}", in(reg) addr);
+                            addr += 64;
+                        }
+                        // Invalidate instruction cache for the entire range
+                        core::arch::asm!("ic iallu"); // Invalidate all instruction cache
+                        // Ensure completion
+                        core::arch::asm!("dsb ish");
+                        core::arch::asm!("isb");
+                    }
+
+                    let debug_msg = b"[ELF] Cache maintenance completed for executable segment\r\n";
+                    for &byte in debug_msg {
+                        (0x09000000 as *mut u8).write(byte);
+                    }
+                }
             }
         }
 
