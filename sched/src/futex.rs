@@ -9,7 +9,7 @@
 //! the caller's value-check (in sys_futex) and the context switch here, so
 //! FUTEX_WAIT is race-free without additional locking.
 
-use super::{CURRENT_PID, CURRENT_CTX, SCHEDULER_CTX, RUN_QUEUE, cpu_id};
+use super::{CURRENT_PID, CURRENT_CTX, SCHEDULER_CTX, RUN_QUEUE, cpu_id, arch_set_page_table};
 use super::context;
 use super::task::TaskState;
 use spin::Mutex;
@@ -60,6 +60,8 @@ pub fn futex_wait(uaddr: usize, _timeout_ptr: usize) -> isize {
         // 3. Yield to scheduler.
         let ctx = CURRENT_CTX[id];
         if !ctx.is_null() {
+            // Switch back to kernel page table and then to scheduler
+            arch_set_page_table(0);
             context::cpu_switch_to(ctx, core::ptr::addr_of!(SCHEDULER_CTX[id]));
         }
 

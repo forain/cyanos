@@ -15,10 +15,19 @@ global_asm!(
     ".global _start",
     ".type   _start, %function",
     "_start:",
+    // Call libc_start_main properly to enable normal init process
+    "   mov  x29, #0",           // clear frame pointer (no parent frame)
+    "   mov  x30, #0",           // clear link register  (no return address)
+    "   mov  x0,  sp",           // argument: initial stack pointer → argc
+    "   bl   __libc_start_main", // tail-call to libc (never returns)
+
     "   mov  x29, #0",           // clear frame pointer (no parent frame)
     "   mov  x30, #0",           // clear link register  (no return address)
     "   mov  x0,  sp",           // argument: initial stack pointer → argc
     "   bl   __libc_start_main", // tail-call (never returns)
+
+    "debug_start_msg:",
+    ".ascii \"[USERSPACE] _start reached! Assembly entry point working correctly!\\n\""
 );
 
 /// Called by `_start` with the raw initial stack pointer.
@@ -35,6 +44,9 @@ global_asm!(
 /// ```
 #[no_mangle]
 pub unsafe extern "C" fn __libc_start_main(sp: *const usize) -> ! {
+    // IMMEDIATE DEBUG: If we reach here, userspace execution is working!
+    debug_print_userspace_entry();
+
     extern "C" {
         fn main(argc: i32, argv: *const *const u8, envp: *const *const u8) -> i32;
     }
@@ -53,6 +65,13 @@ pub unsafe extern "C" fn __libc_start_main(sp: *const usize) -> ! {
 
     let code = main(argc, argv, envp);
     crate::process::exit(code);
+}
+
+/// Emergency debug function to confirm userspace execution
+unsafe fn debug_print_userspace_entry() {
+    // Use direct write syscall to print immediately
+    let msg = b"[USERSPACE] SUCCESS! Userspace execution confirmed - libc_start_main reached!\n";
+    crate::syscall::syscall3(crate::syscall::nr::WRITE, 1, msg.as_ptr() as usize, msg.len());
 }
 
 /// Parse auxv and cache Cyanos-private entries for Stage 2 IPC routing.
