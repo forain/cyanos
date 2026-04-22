@@ -1,18 +1,5 @@
 //! Limine boot protocol — request/response structures and parser.
 //!
-//! The Limine bootloader (https://github.com/limine-bootloader/limine) supports
-//! UEFI on x86-64 and AArch64.  It scans the kernel binary for request
-//! structures identified by 4-word magic numbers, fills in `response` pointers
-//! before jumping to the kernel entry, and provides a clean 64-bit environment:
-//!
-//!   • Already in 64-bit long mode (x86-64) / EL1 (AArch64)
-//!   • Interrupts disabled
-//!   • Paging active (identity map + HHDM)
-//!   • A flat GDT loaded (null / 64-bit code 0x08 / 64-bit data 0x10)
-//!
-//! Kernel entry receives no boot-info argument; all information is obtained
-//! through the request/response mechanism defined here.
-//!
 //! Ref: Limine Boot Protocol Specification
 //!      https://github.com/limine-bootloader/limine/blob/stable/PROTOCOL.md
 
@@ -26,19 +13,25 @@ const COMMON_MAGIC: [u64; 2] = [0xc7b1dd30df4c8b88, 0x0a82e883a194f07b];
 // ── Request structure ─────────────────────────────────────────────────────────
 
 /// Generic Limine request header.
-///
-/// Limine locates these by scanning the kernel image for the 4-word `id`.
-/// It then writes the `response` pointer before handing off to the kernel.
-/// Must live in a writable, non-BSS section so the magic survives zeroing.
 #[repr(C)]
 struct Request {
     id:       [u64; 4],
     revision: u64,
-    response: *mut u8,    // filled by Limine; null if request not satisfied
+    response: *mut u8,
 }
 
-// SAFETY: response is written once by the bootloader, single-threaded at boot.
+/// Specialized request for the entry point.
+#[repr(C)]
+struct EntryPointRequest {
+    id:          [u64; 4],
+    revision:    u64,
+    response:    *mut u8,
+    entry_point: unsafe extern "C" fn() -> !,
+}
+
+// SAFETY: response is written once by the bootloader.
 unsafe impl Sync for Request {}
+unsafe impl Sync for EntryPointRequest {}
 
 impl Request {
     /// Return the response pointer if Limine satisfied this request.
@@ -53,13 +46,24 @@ impl Request {
 
 // ── Requests ──────────────────────────────────────────────────────────────────
 
+extern "C" {
+    fn _start() -> !;
+}
+
 /// Base revision — tells Limine the maximum protocol revision this kernel
-/// understands.  Limine checks this and refuses to boot if incompatible.
-/// Must be in a non-BSS section with these exact two magic words followed
-/// by the revision number.
+/// understands.
 #[link_section = ".limine_requests"]
 #[used]
 static BASE_REVISION: [u64; 3] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 6];
+
+#[link_section = ".limine_requests"]
+#[used]
+static ENTRY_POINT_REQUEST: EntryPointRequest = EntryPointRequest {
+    id:       [COMMON_MAGIC[0], COMMON_MAGIC[1], 0x13d86c035a1cd3e1, 0x2b0caa89d8f3026a],
+    revision: 0,
+    response: core::ptr::null_mut(),
+    entry_point: _start,
+};
 
 #[link_section = ".limine_requests"]
 #[used]
@@ -93,14 +97,6 @@ static MODULE_REQUEST: Request = Request {
     response: core::ptr::null_mut(),
 };
 
-#[link_section = ".limine_requests"]
-#[used]
-static ENTRY_POINT_REQUEST: Request = Request {
-    id:       [COMMON_MAGIC[0], COMMON_MAGIC[1], 0x13d86c035a1cd3e1, 0x2b0caa89d8f3026a],
-    revision: 0,
-    response: core::ptr::null_mut(),
-};
-
 // ── Response layouts ──────────────────────────────────────────────────────────
 
 #[repr(C)]
@@ -117,12 +113,10 @@ struct MemMapEntry {
     typ:    u64,
 }
 
-// Memory map entry types (Limine spec §memory-map-feature)
 const USABLE:                u64 = 0;
 const ACPI_RECLAIMABLE:      u64 = 2;
 const ACPI_NVS:              u64 = 3;
 const BAD_MEMORY:            u64 = 4;
-// 1 = reserved, 5 = bootloader reclaimable, 6 = kernel+modules, 7 = framebuffer
 
 #[repr(C)]
 struct FramebufferResponse {
@@ -173,7 +167,7 @@ struct Module {
     unused:   [u64; 4],
 }
 
-// ── Static memory-map storage (same as multiboot2 parser) ────────────────────
+// ── Static memory-map storage ─────────────────────────────────────────────────
 
 static mut MM: [MemoryRegion; 128] = [MemoryRegion {
     base: 0, length: 0, kind: MemoryType::Reserved,
@@ -181,14 +175,6 @@ static mut MM: [MemoryRegion; 128] = [MemoryRegion {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Parse boot information from Limine request/response structures.
-///
-/// Must be called after Limine has filled the response pointers (i.e., from
-/// `kernel_main` — never from a pre-boot context).
-///
-/// # Safety
-/// Response pointers written by Limine are valid for the lifetime of the
-/// kernel image.  Must be called exactly once, before any allocator init.
 pub unsafe fn parse() -> BootInfo {
     let mut info = BootInfo {
         memory_map:         core::ptr::null(),
@@ -198,17 +184,13 @@ pub unsafe fn parse() -> BootInfo {
         framebuffer_height: 0,
         framebuffer_pitch:  0,
         rsdp_addr:          0,
-        uart_base:          0, // Limine boot: UART discovered via arch init, not BootInfo
+        uart_base:          0,
         initrd_base:        0,
         initrd_size:        0,
     };
 
-    // ── Memory map ───────────────────────────────────────────────────────────
     if let Some(resp) = MEMMAP_REQUEST.response::<MemMapResponse>() {
         let mut idx = 0usize;
-        // Cap the loop count before the pointer arithmetic: a malformed
-        // entry_count could walk resp.entries far off the end of the array
-        // before the idx>=128 output-buffer guard fires.
         let n = (resp.entry_count as usize).min(512);
         for i in 0..n {
             if idx >= 128 { break; }
@@ -227,7 +209,6 @@ pub unsafe fn parse() -> BootInfo {
         info.memory_map_len = idx;
     }
 
-    // ── Framebuffer ──────────────────────────────────────────────────────────
     if let Some(resp) = FRAMEBUFFER_REQUEST.response::<FramebufferResponse>() {
         if resp.framebuffer_count > 0 {
             let fb = &**resp.framebuffers;
@@ -238,15 +219,12 @@ pub unsafe fn parse() -> BootInfo {
         }
     }
 
-    // ── ACPI RSDP ────────────────────────────────────────────────────────────
     if let Some(resp) = RSDP_REQUEST.response::<RsdpResponse>() {
         info.rsdp_addr = resp.address as u64;
     }
 
-    // ── Modules (initrd) ─────────────────────────────────────────────────────
     if let Some(resp) = MODULE_REQUEST.response::<ModuleResponse>() {
         if resp.module_count > 0 {
-            // Use the first module as initrd
             let module = &**resp.modules;
             info.initrd_base = module.address as u64;
             info.initrd_size = module.size;

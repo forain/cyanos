@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 build = "build.rs"
 
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
 [features]
 # Target Raspberry Pi 5 (BCM2712 + RP1).
 # Propagates to arch-aarch64 which selects correct MMIO addresses.

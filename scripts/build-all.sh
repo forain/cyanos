@@ -177,11 +177,66 @@ build_kernel() {
         target="targets/x86_64-unknown-kernel.json"
     fi
 
+    # Build regular kernel (for Limine)
     cargo +nightly rustc --package kernel --target "$target" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec -- -C link-arg=-z -C link-arg=max-page-size=0x1000
     if [ $? -ne 0 ]; then
         echo "❌ $arch kernel build failed"
         exit 1
     fi
+
+    # Build direct-boot kernel (for QEMU -kernel) using different linker
+    local linker_script
+    if [[ "$arch" == "aarch64" ]]; then
+        linker_script="linkers/aarch64-direct.ld"
+    else
+        linker_script="linkers/x86_64-direct.ld"
+    fi
+
+    # Build direct-boot version with custom linker script
+    cargo +nightly rustc --package kernel --target "$target" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec -- -C link-arg=-T -C link-arg="$linker_script" -C link-arg=-z -C link-arg=max-page-size=0x1000
+    if [ $? -ne 0 ]; then
+        echo "❌ $arch direct-boot kernel build failed"
+        exit 1
+    fi
+
+    # Copy the kernel binaries from deps folder to expected locations
+    local target_dir
+    if [[ "$arch" == "aarch64" ]]; then
+        target_dir="target/aarch64-unknown-kernel/release"
+    else
+        target_dir="target/x86_64-unknown-kernel/release"
+    fi
+
+    # Find the kernel binary in deps (it has a hash suffix)
+    local kernel_binary=$(find "$target_dir/deps" -name "kernel-*" -type f | grep -v '\.d$' | head -1)
+    if [[ -n "$kernel_binary" ]]; then
+        # The last built one is the direct-boot version, copy and rename
+        rm -f "$target_dir/kernel-direct"
+        cp "$kernel_binary" "$target_dir/kernel-direct"
+        echo "✅ Created direct-boot kernel: $target_dir/kernel-direct"
+
+        # Build regular kernel again for Limine
+        cargo +nightly rustc --package kernel --target "$target" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec -- -C link-arg=-z -C link-arg=max-page-size=0x1000
+        if [ $? -ne 0 ]; then
+            echo "❌ $arch regular kernel build failed"
+            exit 1
+        fi
+
+        # Find the new kernel binary for Limine version
+        local limine_kernel=$(find "$target_dir/deps" -name "kernel-*" -type f | grep -v '\.d$' | head -1)
+        if [[ -n "$limine_kernel" ]]; then
+            rm -f "$target_dir/kernel"
+            cp "$limine_kernel" "$target_dir/kernel"
+            echo "✅ Created regular kernel: $target_dir/kernel"
+        else
+            echo "❌ Could not find Limine kernel binary"
+            exit 1
+        fi
+    else
+        echo "❌ Could not find kernel binary in $target_dir/deps"
+        exit 1
+    fi
+
     echo "✅ $arch kernel build complete"
 }
 
@@ -191,38 +246,48 @@ create_disk_image() {
     local limine_dir="$2"
     local image_name="cyanos-limine-$arch.img"
 
-    echo "💽 Creating $arch Limine UEFI disk image..."
+    echo "💽 Creating $arch Limine UEFI disk image with GPT..."
 
     # Remove existing disk image
     rm -f "$image_name"
 
-    # Create 64MB disk image with FAT32 filesystem
-    echo "  Creating 64MB $arch disk image with FAT32..."
+    # Create 64MB disk image
     dd if=/dev/zero of="$image_name" bs=1M count=64 2>/dev/null
-    mkfs.fat -F 32 -n CYANOS "$image_name" >/dev/null 2>&1
-
+    
+    # Create GPT table and one partition (type EFI System)
+    # g: gpt, n: new, 1: part 1, 2048: start, default end, t: type, 1: EFI System, w: write
+    printf "g\nn\n1\n2048\n\nt\n1\nw\n" | fdisk "$image_name" >/dev/null 2>&1 || true
+    
+    # Create the FAT32 filesystem in a temporary file (60MB)
+    local temp_fat="temp_fat_$arch.img"
+    rm -f "$temp_fat"
+    mkfs.fat -C "$temp_fat" 61440 -F 32 -n CYANOS >/dev/null 2>&1
+    
     # Create directory structure
-    echo "  Creating directory structure..."
-    mmd -i "$image_name" ::/EFI
-    mmd -i "$image_name" ::/EFI/BOOT
-
-    # Copy appropriate UEFI bootloader
-    echo "  Copying UEFI bootloader..."
-    if [[ "$arch" == "aarch64" ]]; then
-        mcopy -oi "$image_name" "$limine_dir/BOOTAA64.EFI" ::/EFI/BOOT/BOOTAA64.EFI
-        # Copy kernel and initrd
-        mcopy -oi "$image_name" "target/aarch64-unknown-kernel/release/kernel" ::/cyanos-kernel
-        mcopy -oi "$image_name" "initrd-aarch64.cpio.gz" ::/initrd-raw.bin
+    mmd -i "$temp_fat" ::/EFI
+    mmd -i "$temp_fat" ::/EFI/BOOT
+    mmd -i "$temp_fat" ::/boot
+    mmd -i "$temp_fat" ::/boot/limine
+    
+    # Copy appropriate UEFI bootloader and kernel files
+    if [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
+        mcopy -oi "$temp_fat" "$limine_dir/BOOTAA64.EFI" ::/EFI/BOOT/BOOTAA64.EFI
+        mcopy -oi "$temp_fat" "target/aarch64-unknown-kernel/release/kernel" ::/cyanos-kernel
+        mcopy -oi "$temp_fat" "initrd-aarch64.cpio.gz" ::/initrd-raw.bin
     else
-        mcopy -oi "$image_name" "$limine_dir/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
-        # Copy kernel and initrd
-        mcopy -oi "$image_name" "target/x86_64-unknown-kernel/release/kernel" ::/cyanos-kernel
-        mcopy -oi "$image_name" "initrd-x86_64.cpio.gz" ::/initrd-raw.bin
+        mcopy -oi "$temp_fat" "$limine_dir/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
+        mcopy -oi "$temp_fat" "target/x86_64-unknown-kernel/release/kernel" ::/cyanos-kernel
+        mcopy -oi "$temp_fat" "initrd-x86_64.cpio.gz" ::/initrd-raw.bin
     fi
 
-    # Copy Limine configuration
-    echo "  Copying Limine configuration..."
-    mcopy -oi "$image_name" limine/limine.conf ::/limine.conf
+    # Copy Limine configuration to multiple locations
+    mcopy -oi "$temp_fat" limine/limine.conf ::/limine.conf
+    mcopy -oi "$temp_fat" limine/limine.conf ::/boot/limine/limine.conf
+    mcopy -oi "$temp_fat" limine/limine.conf ::/EFI/BOOT/limine.conf
+    
+    # dd the FAT image into the partition at offset 1MB (sector 2048)
+    dd if="$temp_fat" of="$image_name" bs=512 seek=2048 conv=notrunc 2>/dev/null
+    rm -f "$temp_fat"
 
     echo "✅ $arch Limine UEFI disk image created: $image_name"
 }

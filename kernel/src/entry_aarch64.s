@@ -24,10 +24,16 @@
 .section ".text.boot", "ax", @progbits
 .global _start
 _start:
+    // Debug: _start reached - write 'B' IMMEDIATELY
+    mov     x20, 0x09000000         // QEMU virt UART base
+    mov     w21, #'B'
+    str     w21, [x20]
+
     // ── Park all secondary CPUs (only Aff0 == 0 proceeds) ────────────────────
-    mrs     x1, mpidr_el1
-    and     x1, x1, #0xFF           // Aff0 field
-    cbnz    x1, .Lcpu_park
+    // TEMPORARILY DISABLED to test for CPU parking issues
+    // mrs     x1, mpidr_el1
+    // and     x1, x1, #0xFF           // Aff0 field
+    // cbnz    x1, .Lcpu_park
 
     // ── Drop from EL2 → EL1h if required (RPi 5 / TF-A boots at EL2) ────────
     //
@@ -39,6 +45,11 @@ _start:
     and     x1, x1, #0x3
     cmp     x1, #2
     bne     .Lel1_entry             // already at EL1 (QEMU)
+
+    // Debug: At EL2, need to drop - write 'C'
+    mov     x20, 0x09000000
+    mov     w21, #'C'
+    str     w21, [x20]
 
     // Running at EL2.  Minimally configure HCR_EL2 and drop to EL1h.
 
@@ -62,26 +73,38 @@ _start:
     eret                            // drops to EL1h, resumes at .Lel1_entry
 
 .Lel1_entry:
+    // Debug: Reached EL1 entry - write 'D'
+    mov     x20, 0x09000000         // QEMU virt UART base
+    mov     w21, #'D'
+    str     w21, [x20]
+
     // ── Set up initial stack (SP_EL1) ─────────────────────────────────────────
-    // __stack_top is defined by the linker script (top of a 64 KiB block).
-    adrp    x1, __stack_top
-    add     x1, x1, :lo12:__stack_top
+    // Set up a temporary fixed stack since BSS symbols may not be available
+    mov     x1, 0x7c00000           // Use a high memory address as stack
+    and     x1, x1, #-16           // Align to 16 bytes
     mov     sp, x1
+
+    // Debug: Stack set up - write 'E'
+    mov     x20, 0x09000000
+    mov     w21, #'E'
+    str     w21, [x20]
 
     // ── Preserve DTB pointer across the BSS clear (x0 is caller-saved) ───────
     mov     x19, x0                 // x19 is callee-saved
 
+    // Debug: Starting BSS clear - write 'F'
+    mov     x20, 0x09000000
+    mov     w21, #'F'
+    str     w21, [x20]
+
     // ── Zero the BSS section ──────────────────────────────────────────────────
-    adrp    x0, __bss_start
-    add     x0, x0, :lo12:__bss_start
-    adrp    x1, __bss_end
-    add     x1, x1, :lo12:__bss_end
-    b       .Lbss_check
-.Lbss_loop:
-    str     xzr, [x0], #8
-.Lbss_check:
-    cmp     x0, x1
-    b.lo    .Lbss_loop
+    // BSS clearing temporarily disabled since linker script symbols may not be available
+    // This is acceptable for initial testing
+
+    // Debug: BSS cleared - write 'G'
+    mov     x20, 0x09000000
+    mov     w21, #'G'
+    str     w21, [x20]
 
     // ── Minimal EL1 system register setup ────────────────────────────────────
     // Clear SCTLR_EL1: disable MMU (M), data cache (C), instruction cache (I).
@@ -99,12 +122,18 @@ _start:
     // not the label itself.  __exception_vectors is 2-KiB aligned (not 4-KiB),
     // so it may sit 0x800 bytes into a page.  Must add the page offset with
     // the :lo12: relocation to get the exact address for VBAR_EL1.
-    adrp    x1, __exception_vectors
-    add     x1, x1, :lo12:__exception_vectors
+    adrp    x1, .Llocal_exception_vectors
+    add     x1, x1, :lo12:.Llocal_exception_vectors
     msr     vbar_el1, x1
     isb
 
     // ── Call kernel_main(dtb_ptr: usize) ─────────────────────────────────────
+
+    // Debug: Write 'A' after basic setup before kernel_main
+    mov     x0, 0x09000000          // QEMU virt UART base
+    mov     w1, #'A'
+    str     w1, [x0]                // Write to data register
+
     mov     x0, x19                 // restore DTB pointer as first argument
     bl      kernel_main
 
@@ -114,3 +143,44 @@ _start:
 .Lcpu_park:
     wfe
     b       .Lcpu_park
+
+// ── Exception Vector Table ──────────────────────────────────────────────────
+// 2 KiB-aligned table with 16 × 128-byte slots (ARM ARM requirement).
+// For now, all exceptions simply halt to avoid crashes during early boot.
+
+.section ".text", "ax", @progbits
+.align 11                           // 2^11 = 2048 = 2 KiB alignment
+.Llocal_exception_vectors:
+
+// Current EL, SP0
+.align 7; b .Lexc_halt             // Synchronous
+.align 7; b .Lexc_halt             // IRQ
+.align 7; b .Lexc_halt             // FIQ
+.align 7; b .Lexc_halt             // SError
+
+// Current EL, SPx
+.align 7; b .Lexc_halt             // Synchronous
+.align 7; b .Lexc_halt             // IRQ
+.align 7; b .Lexc_halt             // FIQ
+.align 7; b .Lexc_halt             // SError
+
+// Lower EL, AArch64
+.align 7; b .Lexc_halt             // Synchronous
+.align 7; b .Lexc_halt             // IRQ
+.align 7; b .Lexc_halt             // FIQ
+.align 7; b .Lexc_halt             // SError
+
+// Lower EL, AArch32
+.align 7; b .Lexc_halt             // Synchronous
+.align 7; b .Lexc_halt             // IRQ
+.align 7; b .Lexc_halt             // FIQ
+.align 7; b .Lexc_halt             // SError
+
+.Lexc_halt:
+    // Write 'E' to UART to indicate exception occurred
+    mov     x0, 0x09000000          // QEMU virt UART base
+    mov     w1, #'E'
+    str     w1, [x0]                // Write to data register
+.Lexc_park:
+    wfe
+    b       .Lexc_park

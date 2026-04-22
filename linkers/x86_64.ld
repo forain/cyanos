@@ -1,8 +1,14 @@
-ENTRY(kstart)
+ENTRY(_start)
 OUTPUT_FORMAT(elf64-x86-64)
 
 SECTIONS {
     . = 0xffffffff80200000;
+
+    .multiboot2_header ALIGN(8) : AT(ADDR(.multiboot2_header) - 0xffffffff80000000) {
+        *(.multiboot2_header*)
+    }
+
+    /* .note.Xen section removed due to linker issues */
 
     .text ALIGN(4K) : AT(ADDR(.text) - 0xffffffff80000000) {
         __text_start = .;
@@ -28,13 +34,10 @@ SECTIONS {
     .data ALIGN(4K) : AT(ADDR(.data) - 0xffffffff80000000) {
         __rodata_end = .;
         *(.data*)
+        *(.limine_requests*)
         . = ALIGN(4K);
         __bss_start = .;
         *(.bss*)
-        /* Kernel stack: 1 MiB, 16-byte aligned */
-        . = ALIGN(16);
-        . += 0x100000;
-        __stack_top = .;
         . = ALIGN(8);
         __bss_end = .;
     }

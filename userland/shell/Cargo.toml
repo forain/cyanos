@@ -1,0 +1,11 @@
+[package]
+name = "cyanos-shell"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "shell"
+path = "src/main.rs"
+
+[dependencies]
+cyanos-libc = { path = "../libc" }

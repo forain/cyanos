@@ -20,13 +20,10 @@ SECTIONS {
 
     .data : AT(ADDR(.data) - 0xffffffff80000000) {
         *(.data*)
+        *(.limine_requests*)
 	. = ALIGN(4096);
         __bss_start = .;
         *(.bss*)
-        /* Kernel stack: 1 MiB, 16-byte aligned */
-        . = ALIGN(16);
-        . += 0x100000;
-        __stack_top = .;
         . = ALIGN(8);
         __bss_end = .;
 	. = ALIGN(4096);

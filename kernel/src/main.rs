@@ -12,26 +12,32 @@
 use core::panic::PanicInfo;
 use core::alloc::{GlobalAlloc, Layout};
 
-mod init;
-mod syscall;
-mod mem;
-
 // ── Global Allocator ─────────────────────────────────────────────────────────
 
-struct SlabAllocator;
+struct DummyAllocator;
 
-unsafe impl GlobalAlloc for SlabAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        mm::slab::alloc(layout.size()).unwrap_or(core::ptr::null_mut())
+unsafe impl GlobalAlloc for DummyAllocator {
+    unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+        core::ptr::null_mut()
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        mm::slab::free(ptr, layout.size())
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        // Do nothing - this is a dummy allocator
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: SlabAllocator = SlabAllocator;
+static ALLOCATOR: DummyAllocator = DummyAllocator;
+
+// External crate imports
+#[cfg(target_arch = "x86_64")]
+extern crate arch_x86_64;
+#[cfg(target_arch = "aarch64")]
+extern crate arch_aarch64;
+
+mod init;
+mod syscall;
+mod mem;
 
 // ── Architecture-specific boot stubs ─────────────────────────────────────────
 // Each stub provides `_start`, sets up the stack, zeros BSS, then calls
@@ -41,7 +47,7 @@ static ALLOCATOR: SlabAllocator = SlabAllocator;
 core::arch::global_asm!(include_str!("entry_aarch64.s"));
 
 #[cfg(target_arch = "x86_64")]
-mod x86_64_start;
+core::arch::global_asm!(include_str!("entry_x86_64.s"));
 
 // ── Serial port (for early debug output) ─────────────────────────────────────
 
@@ -178,65 +184,39 @@ fn print_hex(mut n: u64) {
 ///   x86-64  — physical address of the multiboot2 info structure
 ///   AArch64 — physical address of the device tree blob (DTB), or 0
 #[no_mangle]
-pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
-    // Skip early_serial_init to avoid UART MMIO hang
-    unsafe { early_serial_init(); }
-
-    // Parse boot info from bootloader
-    let boot_info = unsafe {
-        #[cfg(target_arch = "x86_64")]
-        { boot::limine::parse() }
-        #[cfg(target_arch = "aarch64")]
-        {
-            // Try Limine protocol first, then DTB if provided, otherwise use default
-            let limine_info = boot::limine::parse();
-            if limine_info.memory_map_len > 0 {
-                serial_print("[BOOT] Using Limine boot protocol\n");
-                limine_info
-            } else if boot_info_addr != 0 {
-                serial_print("[BOOT] Using DTB from boot loader\n");
-                boot::device_tree::parse(boot_info_addr)
-            } else {
-                serial_print("[BOOT] Using default QEMU virt config\n");
-                boot::device_tree::create_qemu_virt_default()
-            }
-        }
-    };
-
-    // Initialize architecture hardware
+pub extern "C" fn kernel_main(_boot_info_addr: usize) -> ! {
+    // Output early debug marker to show we've reached kernel_main
     #[cfg(target_arch = "x86_64")]
-    { arch_x86_64::init(); }
-    #[cfg(target_arch = "aarch64")]
-    { arch_aarch64::init(); }
-
-    // Initialize memory manager
-    mm::init_with_map(boot_info.memory_regions());
-
-    // Initialize scheduler
-    sched::init();
-
-    // Initialize IPC
-    ipc::init();
-
-    // Load and spawn userland init as PID 1
-    serial_print("[CYANOS] Loading userland init binary\n");
-
-    match init::load_userland_init(&boot_info) {
-        Some(pid) => {
-            serial_print("[CYANOS] Userland init spawned with PID: ");
-            print_number(pid);
-            serial_print("\n");
+    unsafe {
+        // Write '@' to COM1 to show kernel_main entry
+        let mut status: u8;
+        // Wait for transmitter ready
+        loop {
+            core::arch::asm!("in al, dx", out("al") status, in("dx") 0x3FDu16, options(nomem, nostack));
+            if status & 0x20 != 0 { break; }
         }
-        None => {
-            serial_print("[CYANOS] Failed to spawn userland init\n");
-            loop { core::hint::spin_loop(); }
-        }
+        core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b'@', options(nomem, nostack));
     }
 
-    // Enter the scheduler run loop - this never returns
-    serial_print("[CYANOS] Entering scheduler run loop\n");
-    serial_print("[CYANOS] About to call sched::run()\n");
-    sched::run()
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        // Write '@' to UART to show kernel_main entry
+        #[cfg(not(feature = "rpi5"))]
+        let base = 0x09000000usize;
+        #[cfg(feature = "rpi5")]
+        let base = 0x107D_0010_00usize;
+
+        // Wait until TX FIFO not full (FR register bit 5 = TXFF).
+        let fr = (base + 0x18) as *const u32;
+        while fr.read_volatile() & (1 << 5) != 0 {}
+        let dr = base as *mut u32;
+        dr.write_volatile(b'@' as u32);
+    }
+
+    // Minimal kernel - just halt immediately
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 // ── Test functions ────────────────────────────────────────────────────────────
