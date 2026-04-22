@@ -2,6 +2,7 @@
 name = "kernel"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [features]
 # Target Raspberry Pi 5 (BCM2712 + RP1).
