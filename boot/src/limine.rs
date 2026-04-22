@@ -59,7 +59,7 @@ impl Request {
 /// by the revision number.
 #[link_section = ".limine_requests"]
 #[used]
-static BASE_REVISION: [u64; 3] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 2];
+static BASE_REVISION: [u64; 3] = [0xf9562b2d5c95a6c8, 0x6a7b384944536bdc, 6];
 
 #[link_section = ".limine_requests"]
 #[used]
@@ -81,6 +81,22 @@ static FRAMEBUFFER_REQUEST: Request = Request {
 #[used]
 static RSDP_REQUEST: Request = Request {
     id:       [COMMON_MAGIC[0], COMMON_MAGIC[1], 0xc5e77b6b397e7b43, 0x27637845accdcf3c],
+    revision: 0,
+    response: core::ptr::null_mut(),
+};
+
+#[link_section = ".limine_requests"]
+#[used]
+static MODULE_REQUEST: Request = Request {
+    id:       [COMMON_MAGIC[0], COMMON_MAGIC[1], 0xad97e90e83f1ed83, 0xa7a3e59b2c5d9f5a],
+    revision: 0,
+    response: core::ptr::null_mut(),
+};
+
+#[link_section = ".limine_requests"]
+#[used]
+static ENTRY_POINT_REQUEST: Request = Request {
+    id:       [COMMON_MAGIC[0], COMMON_MAGIC[1], 0x13d86c035a1cd3e1, 0x2b0caa89d8f3026a],
     revision: 0,
     response: core::ptr::null_mut(),
 };
@@ -140,6 +156,23 @@ struct RsdpResponse {
     address:  *const u8,
 }
 
+#[repr(C)]
+struct ModuleResponse {
+    revision:     u64,
+    module_count: u64,
+    modules:      *const *const Module,
+}
+
+#[repr(C)]
+struct Module {
+    address:  *const u8,
+    size:     u64,
+    path:     *const u8,
+    cmdline:  *const u8,
+    media_type: u64,
+    unused:   [u64; 4],
+}
+
 // ── Static memory-map storage (same as multiboot2 parser) ────────────────────
 
 static mut MM: [MemoryRegion; 128] = [MemoryRegion {
@@ -166,6 +199,8 @@ pub unsafe fn parse() -> BootInfo {
         framebuffer_pitch:  0,
         rsdp_addr:          0,
         uart_base:          0, // Limine boot: UART discovered via arch init, not BootInfo
+        initrd_base:        0,
+        initrd_size:        0,
     };
 
     // ── Memory map ───────────────────────────────────────────────────────────
@@ -206,6 +241,16 @@ pub unsafe fn parse() -> BootInfo {
     // ── ACPI RSDP ────────────────────────────────────────────────────────────
     if let Some(resp) = RSDP_REQUEST.response::<RsdpResponse>() {
         info.rsdp_addr = resp.address as u64;
+    }
+
+    // ── Modules (initrd) ─────────────────────────────────────────────────────
+    if let Some(resp) = MODULE_REQUEST.response::<ModuleResponse>() {
+        if resp.module_count > 0 {
+            // Use the first module as initrd
+            let module = &**resp.modules;
+            info.initrd_base = module.address as u64;
+            info.initrd_size = module.size;
+        }
     }
 
     info

@@ -49,6 +49,9 @@ pub struct BootInfo {
     pub rsdp_addr:           u64,
     /// UART MMIO base address discovered from DTB (0 if not found / not a DTB boot).
     pub uart_base:           u64,
+    /// Initrd/ramdisk physical address and size (0 if not present).
+    pub initrd_base:         u64,
+    pub initrd_size:         u64,
 }
 
 // SAFETY: the BootInfo struct is set up once by the entry stub before any

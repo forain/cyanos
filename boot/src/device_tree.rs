@@ -70,6 +70,8 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
         framebuffer_pitch:   0,
         rsdp_addr:           0,
         uart_base:           0,
+        initrd_base:         0,
+        initrd_size:         0,
     };
 
     // 64 slots: enough for all available regions + firmware memreserve entries.
@@ -105,6 +107,7 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
     let mut in_memory     = false;
     let mut in_framebuf   = false;
     let mut in_pl011      = false;
+    let mut in_chosen     = false;
     let mut address_cells = 2u8;  // default: 2 × u32 = u64
     let mut size_cells    = 2u8;  // default: 2 × u32 = u64
     // Scratch: accumulate framebuffer fields from the /framebuffer node.
@@ -137,6 +140,16 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                 in_framebuf = name == "framebuffer"  || name.starts_with("framebuffer@")
                            || name.starts_with("simple-framebuffer@");
                 in_pl011    = name.starts_with("pl011@") || name.starts_with("uart@");
+                in_chosen   = name == "chosen";
+
+                // Debug: Print when we enter the chosen node
+                if in_chosen {
+                    extern "C" {
+                        fn serial_print_bytes(ptr: *const u8, len: usize);
+                    }
+                    let msg = "[DTB] Entering /chosen node\n";
+                    serial_print_bytes(msg.as_ptr(), msg.len());
+                }
 
                 // Advance past the name (aligned to 4 bytes).
                 pos += (name_len + 1 + 3) & !3;
@@ -149,6 +162,7 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                     in_memory   = false;
                     in_framebuf = false;
                     in_pl011    = false;
+                    in_chosen   = false;
                 }
             }
 
@@ -182,6 +196,18 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                 let prop_name = core::str::from_utf8(
                     core::slice::from_raw_parts(prop_name_ptr, pn_len)
                 ).unwrap_or("");
+
+                // Debug: Print all properties in /chosen node
+                if in_chosen {
+                    extern "C" {
+                        fn serial_print_bytes(ptr: *const u8, len: usize);
+                    }
+                    let prefix = "[DTB] /chosen property: ";
+                    serial_print_bytes(prefix.as_ptr(), prefix.len());
+                    serial_print_bytes(prop_name_ptr, pn_len);
+                    let newline = "\n";
+                    serial_print_bytes(newline.as_ptr(), newline.len());
+                }
 
                 match prop_name {
                     // #address-cells / #size-cells are inheritable: every node
@@ -257,6 +283,34 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
                             off += entry_bytes;
                         }
                     }
+
+                    // ── /chosen node: initrd ──────────────────────────────────────
+                    // QEMU populates the /chosen node with initrd information when
+                    // the -initrd parameter is used:
+                    //   linux,initrd-start = <u64 physical address>
+                    //   linux,initrd-end   = <u64 physical address>
+                    "linux,initrd-start" if in_chosen && data_len >= 8 => {
+                        info.initrd_base = be64(data_ptr);
+                        // Debug: Use serial_print to see the initrd base address
+                        extern "C" {
+                            fn serial_print_bytes(ptr: *const u8, len: usize);
+                        }
+                        let msg = "[DTB] Found linux,initrd-start\n";
+                        serial_print_bytes(msg.as_ptr(), msg.len());
+                    }
+                    "linux,initrd-end" if in_chosen && data_len >= 8 => {
+                        let initrd_end = be64(data_ptr);
+                        if initrd_end > info.initrd_base {
+                            info.initrd_size = initrd_end - info.initrd_base;
+                        }
+                        // Debug: Use serial_print to see the initrd end address
+                        extern "C" {
+                            fn serial_print_bytes(ptr: *const u8, len: usize);
+                        }
+                        let msg = "[DTB] Found linux,initrd-end\n";
+                        serial_print_bytes(msg.as_ptr(), msg.len());
+                    }
+
                     _ => {}
                 }
             }
@@ -331,5 +385,7 @@ pub fn create_qemu_virt_default() -> BootInfo {
         framebuffer_pitch: 0,
         rsdp_addr: 0,
         uart_base: 0x09000000, // QEMU virt PL011 UART
+        initrd_base: 0,
+        initrd_size: 0,
     }
 }
