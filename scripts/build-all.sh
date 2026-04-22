@@ -172,12 +172,12 @@ build_kernel() {
 
     local target
     if [[ "$arch" == "aarch64" ]]; then
-        target="aarch64-unknown-none"
+        target="targets/aarch64-unknown-kernel.json"
     else
-        target="x86_64-unknown-none"
+        target="targets/x86_64-unknown-kernel.json"
     fi
 
-    cargo build --target "$target" --release
+    cargo +nightly rustc --package kernel --target "$target" --release -Z build-std=core,alloc -Zbuild-std-features=compiler-builtins-mem -Zjson-target-spec -- -C link-arg=-z -C link-arg=max-page-size=0x1000
     if [ $? -ne 0 ]; then
         echo "❌ $arch kernel build failed"
         exit 1
@@ -211,12 +211,12 @@ create_disk_image() {
     if [[ "$arch" == "aarch64" ]]; then
         mcopy -oi "$image_name" "$limine_dir/BOOTAA64.EFI" ::/EFI/BOOT/BOOTAA64.EFI
         # Copy kernel and initrd
-        mcopy -oi "$image_name" "target/aarch64-unknown-none/release/kernel" ::/cyanos-kernel
+        mcopy -oi "$image_name" "target/aarch64-unknown-kernel/release/kernel" ::/cyanos-kernel
         mcopy -oi "$image_name" "initrd-aarch64.cpio.gz" ::/initrd-raw.bin
     else
         mcopy -oi "$image_name" "$limine_dir/BOOTX64.EFI" ::/EFI/BOOT/BOOTX64.EFI
         # Copy kernel and initrd
-        mcopy -oi "$image_name" "target/x86_64-unknown-none/release/kernel" ::/cyanos-kernel
+        mcopy -oi "$image_name" "target/x86_64-unknown-kernel/release/kernel" ::/cyanos-kernel
         mcopy -oi "$image_name" "initrd-x86_64.cpio.gz" ::/initrd-raw.bin
     fi
 
@@ -260,14 +260,14 @@ echo "📁 Generated files:"
 
 if [[ "$ARCH" == "both" || "$ARCH" == "aarch64" ]]; then
     echo "   🔷 AArch64 Architecture:"
-    echo "      - target/aarch64-unknown-none/release/kernel (ELF kernel)"
+    echo "      - target/aarch64-unknown-kernel/release/kernel (ELF kernel)"
     echo "      - initrd-aarch64.cpio.gz (gzipped cpio initrd)"
     echo "      - cyanos-limine-aarch64.img (64MB UEFI disk image)"
 fi
 
 if [[ "$ARCH" == "both" || "$ARCH" == "x86_64" ]]; then
     echo "   🔶 x86_64 Architecture:"
-    echo "      - target/x86_64-unknown-none/release/kernel (ELF kernel)"
+    echo "      - target/x86_64-unknown-kernel/release/kernel (ELF kernel)"
     echo "      - initrd-x86_64.cpio.gz (gzipped cpio initrd)"
     echo "      - cyanos-limine-x86_64.img (64MB UEFI disk image)"
 fi
