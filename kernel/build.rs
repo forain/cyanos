@@ -15,7 +15,12 @@ fn main() {
     };
 
     println!("cargo:rustc-link-arg=-T{}", ld.display());
-    println!("cargo:rustc-link-arg=--entry=_start");
+
+    // Different entry points for different architectures
+    match arch.as_str() {
+        "x86_64" => println!("cargo:rustc-link-arg=--entry=kstart"),
+        _ => println!("cargo:rustc-link-arg=--entry=_start"),
+    }
     println!("cargo:rerun-if-changed={}", ld.display());
     // Rerun if either linker script changes (feature switch may not flip).
     println!("cargo:rerun-if-changed={}", workspace.join("arch/aarch64/cyanos.ld").display());

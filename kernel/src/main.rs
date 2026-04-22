@@ -7,6 +7,7 @@
 #![no_std]
 #![no_main]
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
+#![cfg_attr(target_arch = "x86_64", feature(sync_unsafe_cell))]
 
 use core::panic::PanicInfo;
 use core::alloc::{GlobalAlloc, Layout};
@@ -39,7 +40,7 @@ static ALLOCATOR: SlabAllocator = SlabAllocator;
 core::arch::global_asm!(include_str!("entry_aarch64.s"));
 
 #[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(include_str!("entry_x86_64.s"));
+mod x86_64_start;
 
 // ── Serial port (for early debug output) ─────────────────────────────────────
 
@@ -180,14 +181,24 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // Skip early_serial_init to avoid UART MMIO hang
     unsafe { early_serial_init(); }
 
-    // Get default boot info without DTB parsing to avoid serial_print hangs
+    // Parse boot info from bootloader
     let boot_info = unsafe {
         #[cfg(target_arch = "x86_64")]
         { boot::limine::parse() }
         #[cfg(target_arch = "aarch64")]
         {
-            // Always use default config to avoid serial operations in DTB parsing
-            boot::device_tree::create_qemu_virt_default()
+            // Try Limine protocol first, then DTB if provided, otherwise use default
+            let limine_info = boot::limine::parse();
+            if limine_info.memory_map_len > 0 {
+                serial_print("[BOOT] Using Limine boot protocol\n");
+                limine_info
+            } else if boot_info_addr != 0 {
+                serial_print("[BOOT] Using DTB from boot loader\n");
+                boot::device_tree::parse(boot_info_addr)
+            } else {
+                serial_print("[BOOT] Using default QEMU virt config\n");
+                boot::device_tree::create_qemu_virt_default()
+            }
         }
     };
 
@@ -209,7 +220,7 @@ pub extern "C" fn kernel_main(boot_info_addr: usize) -> ! {
     // Load and spawn userland init as PID 1
     serial_print("[CYANOS] Loading userland init binary\n");
 
-    match init::load_userland_init() {
+    match init::load_userland_init(&boot_info) {
         Some(pid) => {
             serial_print("[CYANOS] Userland init spawned with PID: ");
             print_number(pid);
