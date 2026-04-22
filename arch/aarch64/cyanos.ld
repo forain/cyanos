@@ -1,7 +1,7 @@
 /* AArch64 linker script for QEMU -machine virt
  *
- * QEMU virt DRAM starts at 0x40000000.  We link the kernel at 0x40080000
- * to leave the first 512 KiB for QEMU's internal firmware/DTB.
+ * QEMU virt DRAM starts at 0x40000000.  We link the kernel at 0xffffffff40080000
+ * (higher-half mapping) which Limine maps to physical 0x40080000.
  * The kernel entry (_start) must be the very first byte executed.
  *
  * Symbol contract with assembly / Rust:
@@ -15,14 +15,15 @@
 
 ENTRY(_start)
 
-KERNEL_BASE = 0x40080000;
+KERNEL_BASE = 0xffffffff40080000;
+KERNEL_PHYS = 0x40080000;
 
 SECTIONS
 {
     . = KERNEL_BASE;
 
     /* ── Boot stub — must execute before any other .text ─────────────────── */
-    .text.boot : {
+    .text.boot : AT(KERNEL_PHYS) {
         KEEP(*(.text.boot))
     }
 
@@ -36,23 +37,25 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
+    /* ── Limine request structures ────────────────────────────────────────── */
+    .limine_requests : ALIGN(8) {
+        KEEP(*(.limine_requests))
+    }
+
     /* ── Initialised read-write data ─────────────────────────────────────── */
     .data : ALIGN(4096) {
         *(.data .data.*)
     }
 
-    /* ── 1 MiB kernel stack (increased for large Task struct operations) ─── */
-    .stack : ALIGN(16) {
-        __stack_bottom = .;
-        . += 0x100000;          /* 1 MiB (increased from 128 KiB for 267KB Task) */
-        __stack_top = .;
-    }
-
-    /* ── Zero-initialised data ────────────────────────────────────────────── */
+    /* ── Zero-initialised data + stack ───────────────────────────────────── */
     .bss : ALIGN(4096) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
+        /* Kernel stack: 1 MiB, 16-byte aligned (increased for large Task struct operations) */
+        . = ALIGN(16);
+        . += 0x100000;
+        __stack_top = .;
         . = ALIGN(8);
         __bss_end = .;
     }
