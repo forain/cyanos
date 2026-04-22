@@ -268,18 +268,90 @@ core::arch::global_asm!(
     "   ret",
 );
 
+// x86_64 assembly for printf functions
+// On x86_64, System V ABI passes integer args in rdi, rsi, rdx, rcx, r8, r9, then stack
+#[cfg(target_arch = "x86_64")]
+core::arch::global_asm!(
+    // printf(fmt, ...) → printf_impl(fmt, &args[6])
+    ".global printf",
+    ".type printf, @function",
+    "printf:",
+    "   sub  rsp, 56",          // 8 bytes alignment + 6*8 for args
+    "   mov  [rsp+0],  rsi",    // save rsi (arg 1)
+    "   mov  [rsp+8],  rdx",    // save rdx (arg 2)
+    "   mov  [rsp+16], rcx",    // save rcx (arg 3)
+    "   mov  [rsp+24], r8",     // save r8  (arg 4)
+    "   mov  [rsp+32], r9",     // save r9  (arg 5)
+    "   mov  qword ptr [rsp+40], 0", // padding
+    "   mov  rsi, rsp",         // rsi = pointer to saved args
+    "   call printf_impl",
+    "   add  rsp, 56",
+    "   ret",
+
+    // fprintf(fd, fmt, ...) → fprintf_impl(fd, fmt, &args)
+    ".global fprintf",
+    ".type fprintf, @function",
+    "fprintf:",
+    "   sub  rsp, 56",
+    "   mov  [rsp+0],  rdx",    // save rdx (arg 2, first vararg)
+    "   mov  [rsp+8],  rcx",    // save rcx (arg 3)
+    "   mov  [rsp+16], r8",     // save r8  (arg 4)
+    "   mov  [rsp+24], r9",     // save r9  (arg 5)
+    "   mov  qword ptr [rsp+32], 0",
+    "   mov  qword ptr [rsp+40], 0",
+    "   mov  rdx, rsp",         // rdx = pointer to saved args
+    "   call fprintf_impl",
+    "   add  rsp, 56",
+    "   ret",
+
+    // sprintf(buf, fmt, ...) → sprintf_impl(buf, fmt, &args)
+    ".global sprintf",
+    ".type sprintf, @function",
+    "sprintf:",
+    "   sub  rsp, 56",
+    "   mov  [rsp+0],  rdx",    // save rdx (arg 2, first vararg)
+    "   mov  [rsp+8],  rcx",    // save rcx (arg 3)
+    "   mov  [rsp+16], r8",     // save r8  (arg 4)
+    "   mov  [rsp+24], r9",     // save r9  (arg 5)
+    "   mov  qword ptr [rsp+32], 0",
+    "   mov  qword ptr [rsp+40], 0",
+    "   mov  rdx, rsp",         // rdx = pointer to saved args
+    "   call sprintf_impl",
+    "   add  rsp, 56",
+    "   ret",
+
+    // snprintf(buf, size, fmt, ...) → snprintf_impl(buf, size, fmt, &args)
+    ".global snprintf",
+    ".type snprintf, @function",
+    "snprintf:",
+    "   sub  rsp, 56",
+    "   mov  [rsp+0],  rcx",    // save rcx (arg 3, first vararg)
+    "   mov  [rsp+8],  r8",     // save r8  (arg 4)
+    "   mov  [rsp+16], r9",     // save r9  (arg 5)
+    "   mov  qword ptr [rsp+24], 0",
+    "   mov  qword ptr [rsp+32], 0",
+    "   mov  qword ptr [rsp+40], 0",
+    "   mov  rcx, rsp",         // rcx = pointer to saved args
+    "   call snprintf_impl",
+    "   add  rsp, 56",
+    "   ret",
+);
+
+#[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub unsafe extern "C" fn printf_impl(fmt: *const u8, argv: *const u64) -> c_int {
     let mut sink = Sink { kind: SinkKind::Fd(STDOUT_FILENO) };
     do_format(&mut sink, fmt, argv)
 }
 
+#[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub unsafe extern "C" fn fprintf_impl(fd_ptr: *mut u8, fmt: *const u8, argv: *const u64) -> c_int {
     let mut sink = Sink { kind: SinkKind::Fd(fd_ptr as i32) };
     do_format(&mut sink, fmt, argv)
 }
 
+#[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub unsafe extern "C" fn sprintf_impl(buf: *mut u8, fmt: *const u8, argv: *const u64) -> c_int {
     let slice = core::slice::from_raw_parts_mut(buf, usize::MAX / 2);
@@ -290,6 +362,7 @@ pub unsafe extern "C" fn sprintf_impl(buf: *mut u8, fmt: *const u8, argv: *const
     n
 }
 
+#[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub unsafe extern "C" fn snprintf_impl(
     buf: *mut u8, size: size_t, fmt: *const u8, argv: *const u64,
@@ -303,14 +376,53 @@ pub unsafe extern "C" fn snprintf_impl(
     n
 }
 
-// Non-AArch64 stubs so `cargo check` passes on the host.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn printf_impl(fmt: *const u8, argv: *const u64) -> c_int {
+    let mut sink = Sink { kind: SinkKind::Fd(STDOUT_FILENO) };
+    do_format(&mut sink, fmt, argv)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn fprintf_impl(fd_ptr: *mut u8, fmt: *const u8, argv: *const u64) -> c_int {
+    let mut sink = Sink { kind: SinkKind::Fd(fd_ptr as i32) };
+    do_format(&mut sink, fmt, argv)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn sprintf_impl(buf: *mut u8, fmt: *const u8, argv: *const u64) -> c_int {
+    let slice = core::slice::from_raw_parts_mut(buf, usize::MAX / 2);
+    let mut sink = Sink { kind: SinkKind::Buf { data: slice, pos: 0 } };
+    let n = do_format(&mut sink, fmt, argv);
+    let pos = sink.written();
+    if let SinkKind::Buf { data, .. } = sink.kind { data[pos] = 0; }
+    n
+}
+
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn snprintf_impl(
+    buf: *mut u8, size: size_t, fmt: *const u8, argv: *const u64,
+) -> c_int {
+    if size == 0 { return 0; }
+    let slice = core::slice::from_raw_parts_mut(buf, size);
+    let mut sink = Sink { kind: SinkKind::Buf { data: slice, pos: 0 } };
+    let n = do_format(&mut sink, fmt, argv);
+    let pos = sink.written().min(size - 1);
+    if let SinkKind::Buf { data, .. } = sink.kind { data[pos] = 0; }
+    n
+}
+
+// Stub functions for other architectures (e.g., when running cargo check on host)
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub unsafe extern "C" fn printf_impl(_fmt: *const u8, _argv: *const u64) -> c_int { 0 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub unsafe extern "C" fn fprintf_impl(_s: *mut u8, _fmt: *const u8, _argv: *const u64) -> c_int { 0 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub unsafe extern "C" fn sprintf_impl(_b: *mut u8, _fmt: *const u8, _argv: *const u64) -> c_int { 0 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub unsafe extern "C" fn snprintf_impl(_b: *mut u8, _n: size_t, _fmt: *const u8, _a: *const u64) -> c_int { 0 }
 
 /// `perror` — print `prefix: errno N` to stderr.

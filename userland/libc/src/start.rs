@@ -30,6 +30,22 @@ global_asm!(
     ".ascii \"[USERSPACE] _start reached! Assembly entry point working correctly!\\n\""
 );
 
+// x86_64 entry stub — runs before any C code.
+#[cfg(target_arch = "x86_64")]
+global_asm!(
+    ".section .text._start, \"ax\", @progbits",
+    ".global _start",
+    ".type   _start, @function",
+    "_start:",
+    // Call libc_start_main properly to enable normal init process
+    "   xor  rbp, rbp",          // clear frame pointer (no parent frame)
+    "   mov  rdi, rsp",          // argument: initial stack pointer → argc
+    "   call __libc_start_main", // tail-call to libc (never returns)
+
+    "debug_start_msg:",
+    ".ascii \"[USERSPACE] _start reached! Assembly entry point working correctly!\\n\""
+);
+
 /// Called by `_start` with the raw initial stack pointer.
 ///
 /// Layout at `sp`:
