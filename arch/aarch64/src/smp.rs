@@ -25,6 +25,7 @@ pub const MAX_APS: usize = 7;
 // `aarch64_ap_entry` (the assembly stub below) indexes this array with the
 // context ID passed by PSCI to find its stack.
 
+#[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(r#"
 // ── AP entry stub ─────────────────────────────────────────────────────────────
 //
@@ -124,6 +125,7 @@ pub extern "C" fn gic_cpu_interface_init_ap() {
 ///
 /// # Safety
 /// Must be called from EL1 on a platform that implements PSCI via HVC.
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn cpu_on(mpidr: u64, entry: usize, context_id: u64) -> i64 {
     let result: i64;
     core::arch::asm!(
@@ -146,6 +148,7 @@ pub unsafe fn cpu_on(mpidr: u64, entry: usize, context_id: u64) -> i64 {
 ///
 /// # Safety
 /// Must be called after the buddy allocator and GIC distributor are ready.
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn smp_init(mpidrs: &[u64]) {
     for (i, &mpidr) in mpidrs.iter().enumerate() {
         if i >= MAX_APS { break; }

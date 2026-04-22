@@ -61,53 +61,53 @@ core::arch::global_asm!(r#"
 ap_trampoline_start:
     cli
     cld
-    xorw  %ax, %ax
-    movw  %ax, %ds
-    movw  %ax, %es
-    movw  %ax, %ss
-    lgdtl  0x7120
-    movl   %cr0, %eax
-    orb    $1, %al
-    movl   %eax, %cr0
-    ljmpl  $0x08, $0x7040
+    xor   ax, ax
+    mov   ds, ax
+    mov   es, ax
+    mov   ss, ax
+    lgdt  [0x7120]
+    mov   eax, cr0
+    or    al, 1
+    mov   cr0, eax
+    ljmp  0x08, 0x7040
 
 .balign 0x40, 0x90
 .code32
-    movw  $0x10, %ax
-    movw  %ax,   %ds
-    movw  %ax,   %es
-    movw  %ax,   %ss
-    xorw  %ax,   %ax
-    movw  %ax,   %fs
-    movw  %ax,   %gs
-    movl  %cr4,  %eax
-    orl   $(1 << 5), %eax
-    movl  %eax,  %cr4
-    movl  0x7F00, %eax
-    movl  %eax,  %cr3
-    movl  $0xC0000080, %ecx
+    mov   ax, 0x10
+    mov   ds, ax
+    mov   es, ax
+    mov   ss, ax
+    xor   ax, ax
+    mov   fs, ax
+    mov   gs, ax
+    mov   eax, cr4
+    or    eax, (1 << 5)
+    mov   cr4, eax
+    mov   eax, [0x7F00]
+    mov   cr3, eax
+    mov   ecx, 0xC0000080
     rdmsr
-    orl   $(1 << 8), %eax
+    or    eax, (1 << 8)
     wrmsr
-    movl  %cr0,  %eax
-    orl   $0x80000000, %eax
-    movl  %eax,  %cr0
-    ljmpl $0x18, $0x7080
+    mov   eax, cr0
+    or    eax, 0x80000000
+    mov   cr0, eax
+    ljmp  0x18, 0x7080
 
 .balign 0x80, 0x90
 .code64
-    xorl  %eax, %eax
-    movl  %eax, %ds
-    movl  %eax, %es
-    movl  %eax, %ss
-    movq  $0x7F10, %rbx
-    movl  $1,      %eax
-    lock xaddl %eax, (%rbx)
-    movq  $0x7F18, %rbx
-    movq  (%rbx, %rax, 8), %rsp
-    callq *0x7F08
+    xor   eax, eax
+    mov   ds, eax
+    mov   es, eax
+    mov   ss, eax
+    mov   rbx, 0x7F10
+    mov   eax, 1
+    lock xadd [rbx], eax
+    mov   rbx, 0x7F18
+    mov   rsp, [rbx + rax*8]
+    call  qword ptr [0x7F08]
 0:  hlt
-    jmp 0b
+    jmp   0b
 
 .global ap_trampoline_end
 ap_trampoline_end:

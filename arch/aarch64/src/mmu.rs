@@ -38,9 +38,12 @@ static mut ID_L1: PageTable = PageTable([0u64; 512]);
 /// translation table walks concurrently.
 pub unsafe fn enable_identity() {
     // Read SCTLR_EL1; skip if MMU already enabled.
-    let sctlr: u64;
-    core::arch::asm!("mrs {v}, SCTLR_EL1", v = out(reg) sctlr, options(nostack, nomem));
-    if sctlr & 1 != 0 { return; }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let sctlr: u64;
+        core::arch::asm!("mrs {v}, SCTLR_EL1", v = out(reg) sctlr, options(nostack, nomem));
+        if sctlr & 1 != 0 { return; }
+    }
 
     // ── L1 block descriptor attribute words ──────────────────────────────────
     //
@@ -109,24 +112,27 @@ pub unsafe fn enable_identity() {
 
     // ── Activate ─────────────────────────────────────────────────────────────
 
-    core::arch::asm!("msr TCR_EL1, {}", in(reg) tcr, options(nostack));
-    core::arch::asm!("isb", options(nostack, nomem));
+    #[cfg(target_arch = "aarch64")]
+    {
+        core::arch::asm!("msr TCR_EL1, {}", in(reg) tcr, options(nostack));
+        core::arch::asm!("isb", options(nostack, nomem));
 
-    core::arch::asm!("msr TTBR0_EL1, {}", in(reg) l0_phys, options(nostack));
-    core::arch::asm!("msr TTBR1_EL1, {}", in(reg) l0_phys, options(nostack));  // Same identity mapping for kernel
-    core::arch::asm!("isb", options(nostack, nomem));
+        core::arch::asm!("msr TTBR0_EL1, {}", in(reg) l0_phys, options(nostack));
+        core::arch::asm!("msr TTBR1_EL1, {}", in(reg) l0_phys, options(nostack));  // Same identity mapping for kernel
+        core::arch::asm!("isb", options(nostack, nomem));
 
-    // Invalidate all EL1 TLB entries before enabling the MMU.
-    core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
-    core::arch::asm!("dsb sy",       options(nostack, nomem));
-    core::arch::asm!("isb",          options(nostack, nomem));
+        // Invalidate all EL1 TLB entries before enabling the MMU.
+        core::arch::asm!("tlbi vmalle1", options(nostack, nomem));
+        core::arch::asm!("dsb sy",       options(nostack, nomem));
+        core::arch::asm!("isb",          options(nostack, nomem));
 
-    // Enable MMU (bit 0), D-cache (bit 2), I-cache (bit 12).
-    let mut s: u64;
-    core::arch::asm!("mrs {}, SCTLR_EL1", out(reg) s, options(nostack, nomem));
-    s |= (1 << 0) | (1 << 2) | (1 << 12);
-    core::arch::asm!("msr SCTLR_EL1, {}", in(reg) s, options(nostack));
-    core::arch::asm!("isb", options(nostack, nomem));
+        // Enable MMU (bit 0), D-cache (bit 2), I-cache (bit 12).
+        let mut s: u64;
+        core::arch::asm!("mrs {}, SCTLR_EL1", out(reg) s, options(nostack, nomem));
+        s |= (1 << 0) | (1 << 2) | (1 << 12);
+        core::arch::asm!("msr SCTLR_EL1, {}", in(reg) s, options(nostack));
+        core::arch::asm!("isb", options(nostack, nomem));
+    }
 }
 
 /// Debug memory attributes for a given virtual address
@@ -141,17 +147,26 @@ pub unsafe fn debug_memory_attributes(addr: usize) {
     print_hex_addr(addr as u64);
 
     // Check if MMU is enabled
-    let sctlr: u64;
-    core::arch::asm!("mrs {v}, SCTLR_EL1", v = out(reg) sctlr, options(nostack, nomem));
-    if sctlr & 1 == 0 {
-        let msg = b"MMU disabled - identity mapping\r\n";
-        for &b in msg { arch_serial_putc(b); }
-        return;
+    #[cfg(target_arch = "aarch64")]
+    {
+        let sctlr: u64;
+        core::arch::asm!("mrs {v}, SCTLR_EL1", v = out(reg) sctlr, options(nostack, nomem));
+        if sctlr & 1 == 0 {
+            let msg = b"MMU disabled - identity mapping\r\n";
+            for &b in msg { arch_serial_putc(b); }
+            return;
+        }
     }
 
     // Get current page table base
-    let ttbr0: u64;
-    core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0, options(nostack, nomem));
+    #[cfg(target_arch = "aarch64")]
+    let ttbr0: u64 = {
+        let ttbr0: u64;
+        core::arch::asm!("mrs {}, TTBR0_EL1", out(reg) ttbr0, options(nostack, nomem));
+        ttbr0
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let ttbr0: u64 = 0;
 
     let msg = b"TTBR0_EL1: ";
     for &b in msg { arch_serial_putc(b); }

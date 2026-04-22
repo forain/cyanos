@@ -54,9 +54,14 @@ pub fn init() {
         for &b in debug_nl { arch_serial_putc(b); }
 
         // Debug: Check current exception level and system registers
-        let current_el: u64;
-        core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el);
-        let el_level = (current_el >> 2) & 0x3;
+        #[cfg(target_arch = "aarch64")]
+        let el_level: u64 = {
+            let current_el: u64;
+            core::arch::asm!("mrs {}, CurrentEL", out(reg) current_el);
+            (current_el >> 2) & 0x3
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let el_level: u64 = 1;
 
         let debug_el = b"[EXCEPTION] Running at exception level: EL";
         for &b in debug_el { arch_serial_putc(b); }
@@ -184,6 +189,7 @@ pub fn init() {
 
 // ── Vector table (2 KiB aligned) ──────────────────────────────────────────
 
+#[cfg(target_arch = "aarch64")]
 core::arch::global_asm!(r#"
 .section .text
 .balign 2048
@@ -818,8 +824,14 @@ unsafe extern "C" fn irq_dispatch() {
 #[no_mangle]
 unsafe extern "C" fn exc_el1_sync_handler(esr: u64, elr: u64) {
     // Get additional fault information
-    let far: u64;
-    core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
+    #[cfg(target_arch = "aarch64")]
+    let far: u64 = {
+        let far: u64;
+        core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
+        far
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let far: u64 = 0;
 
     // Print detailed data abort information
     print_detailed_data_abort_info(esr, elr, far);
@@ -988,8 +1000,14 @@ unsafe extern "C" fn exc_el0_fault_handler(esr: u64, elr: u64) {
 
     if is_abort {
         // FAR_EL1 holds the faulting virtual address for aborts.
-        let far: u64;
-        core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
+        #[cfg(target_arch = "aarch64")]
+        let far: u64 = {
+            let far: u64;
+            core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
+            far
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let far: u64 = 0;
 
         if sched::handle_page_fault(far as usize) {
             // Fault handled by the demand-paging path — resume the task.

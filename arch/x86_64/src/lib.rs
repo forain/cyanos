@@ -35,3 +35,22 @@ pub fn init() {
     #[cfg(target_arch = "x86_64")]
     syscall::init();
 }
+
+/// x86_64 serial output for early debugging.
+///
+/// Uses 16550 UART at COM1 (0x3F8).
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn arch_serial_putc(c: u8) {
+    use core::arch::asm;
+
+    // Wait for transmit holding register to be empty (bit 5 of LSR)
+    loop {
+        let lsr: u8;
+        asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+        if lsr & 0x20 != 0 { break; }
+    }
+
+    // Send the character
+    asm!("out dx, al", in("dx") 0x3F8u16, in("al") c, options(nomem, nostack));
+}

@@ -168,52 +168,52 @@ syscall_entry:
     swapgs
 
     // 2. Save user RSP; switch to this CPU's kernel SYSCALL stack.
-    movq  %rsp, %gs:8    // PerCpuSyscall.user_rsp_save = user RSP
-    movq  %gs:0, %rsp    // RSP = PerCpuSyscall.kernel_stack_top (16-byte aligned)
+    mov   gs:[8], rsp     // PerCpuSyscall.user_rsp_save = user RSP
+    mov   rsp, gs:[0]     // RSP = PerCpuSyscall.kernel_stack_top (16-byte aligned)
 
     // 3. Save user RFLAGS (r11) and user RIP (rcx) — clobbered by SYSCALL.
     //    After these two pushes RSP = top-16 (16-byte aligned).
-    pushq %r11            // user RFLAGS
-    pushq %rcx            // user RIP
+    push  r11             // user RFLAGS
+    push  rcx             // user RIP
 
     // 4. Push stack args for syscall_dispatch(number,a0,a1,a2,a3,a4,a5,frame_ptr).
     //    syscall_dispatch takes 8 args; the first 6 go in registers, args 7+8
     //    go on the stack.  System V AMD64 ABI requires RSP 16-byte aligned
-    //    BEFORE callq.
+    //    BEFORE call.
     //
-    //    RSP is currently 16-byte aligned (top-16 after pushq r11, pushq rcx).
+    //    RSP is currently 16-byte aligned (top-16 after push r11, push rcx).
     //    push arg8=frame_ptr=0 → RSP%16 == 8
-    //    push arg7=a5(r9)      → RSP%16 == 0  ← aligned for callq ✓
+    //    push arg7=a5(r9)      → RSP%16 == 0  ← aligned for call ✓
     //
     //    r9 (a5) is pushed BEFORE it is overwritten with a4 below.
-    pushq $0              // arg8 = frame_ptr = 0  (fork not supported on x86-64 yet)
-    pushq %r9             // arg7 = a5
+    push  0               // arg8 = frame_ptr = 0  (fork not supported on x86-64 yet)
+    push  r9              // arg7 = a5
 
     // 5. Rearrange remaining regs for System V 6-register calling convention:
     //    syscall_dispatch(number, a0, a1, a2, a3, a4, ...)
     //    On entry: rax=number, rdi=a0, rsi=a1, rdx=a2, r10=a3, r8=a4, r9=pushed
-    movq  %r8,  %r9       // a4 → r9  (must come before r8 is overwritten)
-    movq  %r10, %r8       // a3 → r8
-    movq  %rdx, %rcx      // a2 → rcx
-    movq  %rsi, %rdx      // a1 → rdx
-    movq  %rdi, %rsi      // a0 → rsi
-    movq  %rax, %rdi      // number → rdi
-    callq syscall_dispatch
+    mov   r9,  r8         // a4 → r9  (must come before r8 is overwritten)
+    mov   r8,  r10        // a3 → r8
+    mov   rcx, rdx        // a2 → rcx
+    mov   rdx, rsi        // a1 → rdx
+    mov   rsi, rdi        // a0 → rsi
+    mov   rdi, rax        // number → rdi
+    call  syscall_dispatch
     // rax = return value (isize) — left in rax for SYSRET.
 
     // 6. Remove arg7 + arg8 from stack (16 bytes).
-    addq  $16, %rsp
+    add   rsp, 16
 
     // 7. Restore user RIP and RFLAGS.
-    popq  %rcx            // user RIP   → rcx (restored by SYSRET)
-    popq  %r11            // user RFLAGS → r11 (restored by SYSRET)
+    pop   rcx             // user RIP   → rcx (restored by SYSRET)
+    pop   r11             // user RFLAGS → r11 (restored by SYSRET)
 
     // 8. Restore user RSP and deactivate kernel GS.
-    movq  %gs:8, %rsp
+    mov   rsp, gs:[8]
     swapgs
 
     // 9. Return to user space.
-    sysretq
+    sysret
 
 // ── arch_execve_return — drop into user space at a new entry / stack ──────
 //
@@ -230,32 +230,32 @@ syscall_entry:
 .global arch_execve_return
 .type   arch_execve_return, @function
 arch_execve_return:
-    // Build 5-word IRETQ frame: [RIP, CS, RFLAGS, RSP, SS]
+    // Build 5-word IRET frame: [RIP, CS, RFLAGS, RSP, SS]
     // Pushed in reverse order (stack grows down).
-    pushq $0x1B           // SS  = user data selector
-    pushq %rsi            // RSP = user stack pointer
-    pushq $0x202          // RFLAGS = IF=1
-    pushq $0x23           // CS  = user code selector
-    pushq %rdi            // RIP = entry point
+    push  0x1B            // SS  = user data selector
+    push  rsi             // RSP = user stack pointer
+    push  0x202           // RFLAGS = IF=1
+    push  0x23            // CS  = user code selector
+    push  rdi             // RIP = entry point
     // Zero all general-purpose registers so the new process starts clean.
-    xorq  %rax, %rax
-    xorq  %rbx, %rbx
-    xorq  %rcx, %rcx
-    xorq  %rdx, %rdx
-    xorq  %rsi, %rsi
-    xorq  %rdi, %rdi
-    xorq  %rbp, %rbp
-    xorq  %r8,  %r8
-    xorq  %r9,  %r9
-    xorq  %r10, %r10
-    xorq  %r11, %r11
-    xorq  %r12, %r12
-    xorq  %r13, %r13
-    xorq  %r14, %r14
-    xorq  %r15, %r15
+    xor   rax, rax
+    xor   rbx, rbx
+    xor   rcx, rcx
+    xor   rdx, rdx
+    xor   rsi, rsi
+    xor   rdi, rdi
+    xor   rbp, rbp
+    xor   r8,  r8
+    xor   r9,  r9
+    xor   r10, r10
+    xor   r11, r11
+    xor   r12, r12
+    xor   r13, r13
+    xor   r14, r14
+    xor   r15, r15
     // Restore user GS (kernel GS was activated on SYSCALL entry).
     swapgs
-    iretq
+    iret
 "#);
 
 extern "C" {
