@@ -22,11 +22,21 @@ TARGET="aarch64-unknown-none"
 MODE="debug"
 CHECK=false
 
-for arg in "$@"; do
-    case "$arg" in
+while [[ $# -gt 0 ]]; do
+    case "$1" in
         --check)   CHECK=true ;;
         --release) MODE="release" ;;
+        --target)
+            shift
+            case "$1" in
+                amd64|x86_64) TARGET="x86_64-unknown-none" ;;
+                aarch64) TARGET="aarch64-unknown-none" ;;
+                *) echo "❌ Invalid target: $1. Use aarch64, x86_64, or amd64"; exit 1 ;;
+            esac
+            ;;
+        *) echo "❌ Unknown option: $1"; exit 1 ;;
     esac
+    shift
 done
 
 CARGO_ARGS=(--target "$TARGET" --manifest-path userland/Cargo.toml)

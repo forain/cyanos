@@ -35,6 +35,7 @@ spin = "0.9"
 [profile.dev]
 panic = "abort"
 
+
 [profile.release]
 panic = "abort"
 lto = true

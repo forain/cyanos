@@ -14,10 +14,10 @@
 #   cargo check --target aarch64-linux-android
 
 [build]
-target = "aarch64-unknown-none"
+target = "aarch64-unknown-kernel"
 
 # ── AArch64 — QEMU virt, direct ELF load ─────────────────────────────────────
-[target.aarch64-unknown-none]
+[target.aarch64-unknown-kernel]
 runner = [
     "qemu-system-aarch64",
     "-machine", "virt",
@@ -27,28 +27,13 @@ runner = [
     "-serial",  "mon:stdio",
     "-kernel",
 ]
-rustflags = [
-    "-C", "linker=rust-lld",
-    "-C", "relocation-model=static",
-    "-C", "code-model=small",       # AArch64 only accepts small/tiny/large
-    "-C", "link-arg=-z",
-    "-C", "link-arg=max-page-size=0x1000",
-    "-C", "link-arg=-s",
-    "-C", "strip=symbols",
-]
+rustflags = []
 
 # ── x86-64 — Limine UEFI on a FAT32 disk image ───────────────────────────────
 # The script downloads Limine once (cached in target/limine/), builds a fresh
 # disk image each run, and launches QEMU with OVMF.
 # Prerequisites (install once):
 #   sudo apt install ovmf dosfstools mtools qemu-system-x86
-[target.x86_64-unknown-none]
+[target.x86_64-unknown-kernel]
 runner = "scripts/run-x86_64.sh"
-rustflags = [
-    "-C", "linker=rust-lld",
-    "-C", "relocation-model=static",
-    "-C", "code-model=kernel",
-    "-C", "llvm-args=--x86-asm-syntax=att",
-    "-C", "link-arg=-s",
-    "-C", "strip=symbols",
-]
+rustflags = []

@@ -15,40 +15,49 @@
 
 ENTRY(_start)
 
-KERNEL_BASE = 0xffffffff40080000;
-KERNEL_PHYS = 0x40080000;
+KERNEL_OFFSET = 0xFFFFFF0000000000;
 
 SECTIONS
 {
-    . = KERNEL_BASE;
+    . = KERNEL_OFFSET;
+
+    . += SIZEOF_HEADERS;
+
+    /* Force the zero page to be part of a segment by creating a
+     * dummy section in the zero page.
+     * Limine will map the segment with the lowest vaddr value at
+     * higher half even if the segment has a higher vaddr.
+     * As such without the zero page being part of a segment, the
+     * kernel would be loaded at an offset from the expected
+     * location. As the redox kernel is not currently relocatable,
+     * this would result in a crash.
+     */
+    .dummy ALIGN(8) : AT(ADDR(.dummy) - KERNEL_OFFSET) {}
+
+    . = ALIGN(4096);
 
     /* ── Boot stub — must execute before any other .text ─────────────────── */
-    .text.boot : AT(KERNEL_PHYS) {
+    .text.boot : AT(ADDR(.text.boot) - KERNEL_OFFSET) {
         KEEP(*(.text.boot))
     }
 
     /* ── Normal code ─────────────────────────────────────────────────────── */
-    .text : ALIGN(4096) {
+    .text : AT(ADDR(.text) - KERNEL_OFFSET) {
         *(.text .text.*)
     }
 
     /* ── Read-only data ───────────────────────────────────────────────────── */
-    .rodata : ALIGN(4096) {
+    .rodata ALIGN(4096) : AT(ADDR(.rodata) - KERNEL_OFFSET) {
         *(.rodata .rodata.*)
-    }
-
-    /* ── Limine request structures ────────────────────────────────────────── */
-    .limine_requests : ALIGN(8) {
+        /* ── Limine request structures ────────────────────────────────────────── */
+        . = ALIGN(8);
         KEEP(*(.limine_requests))
     }
 
     /* ── Initialised read-write data ─────────────────────────────────────── */
-    .data : ALIGN(4096) {
+    .data ALIGN(4096) : AT(ADDR(.data) - KERNEL_OFFSET) {
         *(.data .data.*)
-    }
-
-    /* ── Zero-initialised data + stack ───────────────────────────────────── */
-    .bss : ALIGN(4096) {
+        . = ALIGN(4096);
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)
