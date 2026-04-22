@@ -296,7 +296,10 @@ impl Task {
             for &b in step2_msg { arch_serial_putc(b); }
 
             // Set stack pointer
+            #[cfg(target_arch = "aarch64")]
             let sp_ptr = (ctx_ptr as usize + core::mem::offset_of!(CpuContext, sp)) as *mut u64;
+            #[cfg(not(target_arch = "aarch64"))]
+            let sp_ptr = (ctx_ptr as usize + core::mem::offset_of!(CpuContext, rsp)) as *mut u64;
             core::ptr::write_volatile(sp_ptr, stack_top as u64);
 
             let step3_msg = b"Step 3: Set stack pointer\r\n";

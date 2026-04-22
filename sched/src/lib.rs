@@ -157,7 +157,10 @@ pub fn spawn(entry: fn() -> !, priority: i8) -> Option<Pid> {
 
     unsafe {
         let ctx_ptr = (&mut t.ctx) as *mut context::CpuContext;
+        #[cfg(target_arch = "aarch64")]
         let sp_ptr = (ctx_ptr as usize + core::mem::offset_of!(context::CpuContext, sp)) as *mut u64;
+        #[cfg(not(target_arch = "aarch64"))]
+        let sp_ptr = (ctx_ptr as usize + core::mem::offset_of!(context::CpuContext, rsp)) as *mut u64;
         core::ptr::write_volatile(sp_ptr, stack_top as u64);
     }
 
@@ -252,8 +255,11 @@ fn scheduler_run_loop() -> ! {
                         let msg = b"[SCHED] Validating userspace context\r\n";
                         for &b in msg { arch_serial_putc(b); }
 
-                        // Check x30 (lr) which should point to ret_to_user
+                        // Check return address (architecture-specific)
+                        #[cfg(target_arch = "aarch64")]
                         let ret_addr = task_ctx.gregs[11]; // x30 is gregs[11]
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let ret_addr = 0u64; // TODO: Get return address from x86_64 stack
                         let msg2 = b"[SCHED] x30 (ret addr): 0x";
                         for &b in msg2 { arch_serial_putc(b); }
                         // Print address in hex
@@ -265,8 +271,11 @@ fn scheduler_run_loop() -> ! {
                         let msg3 = b"\r\n";
                         for &b in msg3 { arch_serial_putc(b); }
 
-                        // Check stack pointer
+                        // Check stack pointer (architecture-specific)
+                        #[cfg(target_arch = "aarch64")]
                         let sp = task_ctx.sp;
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let sp = task_ctx.rsp;
                         let msg4 = b"[SCHED] Stack pointer: 0x";
                         for &b in msg4 { arch_serial_putc(b); }
                         for shift in (0..16).rev() {
@@ -323,7 +332,10 @@ fn scheduler_run_loop() -> ! {
 
                             // Check current stack pointer
                             let current_sp: u64;
+                            #[cfg(target_arch = "aarch64")]
                             core::arch::asm!("mov {}, sp", out(reg) current_sp);
+                            #[cfg(target_arch = "x86_64")]
+                            core::arch::asm!("mov {}, rsp", out(reg) current_sp);
 
                             let msg = b"[SCHED] Current stack pointer: 0x";
                             for &b in msg { arch_serial_putc(b); }
@@ -343,7 +355,10 @@ fn scheduler_run_loop() -> ! {
 
                             // Set the page table in the task's stack frame (4th word)
                             let task_ctx = &*ctx_ptr;
+                            #[cfg(target_arch = "aarch64")]
                             let stack_ptr = task_ctx.sp as *mut u64;
+                            #[cfg(not(target_arch = "aarch64"))]
+                            let stack_ptr = task_ctx.rsp as *mut u64;
                             stack_ptr.add(3).write(page_table as u64);  // PAGE_TABLE at offset 3
 
                             let msg = b"[SCHED] BYPASS: Direct userspace jump without cpu_switch_to\r\n";
@@ -351,7 +366,10 @@ fn scheduler_run_loop() -> ! {
 
                             // Read context values from the task's stack frame
                             let task_ctx = &*ctx_ptr;
+                            #[cfg(target_arch = "aarch64")]
                             let frame_ptr = task_ctx.sp as *const u64;
+                            #[cfg(not(target_arch = "aarch64"))]
+                            let frame_ptr = task_ctx.rsp as *const u64;
                             let user_sp = unsafe { frame_ptr.add(0).read() } as usize;     // SP_EL0
                             let user_entry = unsafe { frame_ptr.add(1).read() } as usize;  // ELR_EL1
                             let spsr = unsafe { frame_ptr.add(2).read() };                 // SPSR_EL1
@@ -384,6 +402,7 @@ fn scheduler_run_loop() -> ! {
                             for &b in msg { arch_serial_putc(b); }
 
                             // Try a different approach: test minimal userspace execution first
+                            #[cfg(target_arch = "aarch64")]
                             core::arch::asm!(
                                 // Set up userspace registers FIRST (like ret_to_user)
                                 "msr sp_el0, {user_sp}",
@@ -411,6 +430,38 @@ fn scheduler_run_loop() -> ! {
                                 spsr = in(reg) spsr,
                                 options(noreturn)
                             );
+
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                // x86_64: Set up page table (CR3)
+                                if page_table != 0 {
+                                    core::arch::asm!(
+                                        "mov {}, %cr3",
+                                        in(reg) page_table,
+                                        options(att_syntax)
+                                    );
+                                }
+
+                                // x86_64: Write debug character to UART
+                                unsafe {
+                                    core::ptr::write_volatile(0x09000000 as *mut u8, b'@');
+                                }
+
+                                // x86_64: Build IRET frame on kernel stack and jump to userspace
+                                // Stack layout (high to low): SS, RSP, RFLAGS, CS, RIP
+                                core::arch::asm!(
+                                    "push $0x1B",       // User SS (DPL=3)
+                                    "push {user_sp}",   // User RSP
+                                    "push $0x202",      // RFLAGS (IF=1)
+                                    "push $0x23",       // User CS (DPL=3)
+                                    "push {user_entry}", // User RIP
+                                    "mov $0, %rax",     // Return value
+                                    "iretq",            // Jump to userspace
+                                    user_sp = in(reg) user_sp,
+                                    user_entry = in(reg) user_entry,
+                                    options(att_syntax, noreturn)
+                                );
+                            }
 
                         }
                     } else {

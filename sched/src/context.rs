@@ -479,77 +479,77 @@ cpu_switch_to:
 
     // ── save FS.base (TLS pointer) via RDMSR on MSR_FS_BASE (0xC0000100) ─────
     // RDMSR: ecx=MSR, returns edx:eax.  Combine into rax then store at offset 272.
-    movl  $0xC0000100, %ecx
+    mov   ecx, 0xC0000100
     rdmsr
-    shlq  $32, %rdx
-    orq   %rdx, %rax
-    movq  %rax, 272(%rdi)
+    shl   rdx, 32
+    or    rax, rdx
+    mov   [rdi + 272], rax
 
     // ── save outgoing SSE/FPU state ──────────────────────────────────────────
-    movdqu %xmm0,  8(%rdi)
-    movdqu %xmm1,  24(%rdi)
-    movdqu %xmm2,  40(%rdi)
-    movdqu %xmm3,  56(%rdi)
-    movdqu %xmm4,  72(%rdi)
-    movdqu %xmm5,  88(%rdi)
-    movdqu %xmm6,  104(%rdi)
-    movdqu %xmm7,  120(%rdi)
-    movdqu %xmm8,  136(%rdi)
-    movdqu %xmm9,  152(%rdi)
-    movdqu %xmm10, 168(%rdi)
-    movdqu %xmm11, 184(%rdi)
-    movdqu %xmm12, 200(%rdi)
-    movdqu %xmm13, 216(%rdi)
-    movdqu %xmm14, 232(%rdi)
-    movdqu %xmm15, 248(%rdi)
-    stmxcsr 264(%rdi)
+    movdqu [rdi + 8],   xmm0
+    movdqu [rdi + 24],  xmm1
+    movdqu [rdi + 40],  xmm2
+    movdqu [rdi + 56],  xmm3
+    movdqu [rdi + 72],  xmm4
+    movdqu [rdi + 88],  xmm5
+    movdqu [rdi + 104], xmm6
+    movdqu [rdi + 120], xmm7
+    movdqu [rdi + 136], xmm8
+    movdqu [rdi + 152], xmm9
+    movdqu [rdi + 168], xmm10
+    movdqu [rdi + 184], xmm11
+    movdqu [rdi + 200], xmm12
+    movdqu [rdi + 216], xmm13
+    movdqu [rdi + 232], xmm14
+    movdqu [rdi + 248], xmm15
+    stmxcsr [rdi + 264]
 
     // ── save outgoing integer registers ──────────────────────────────────────
-    pushq %rbx
-    pushq %rbp
-    pushq %r12
-    pushq %r13
-    pushq %r14
-    pushq %r15
-    movq  %rsp, (%rdi)      // save rsp into old->rsp
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov  [rdi], rsp         // save rsp into old->rsp
 
     // ── restore incoming integer registers ───────────────────────────────────
-    movq  (%rsi), %rsp      // load rsp from new->rsp
-    popq  %r15
-    popq  %r14
-    popq  %r13
-    popq  %r12
-    popq  %rbp
-    popq  %rbx
+    mov  rsp, [rsi]         // load rsp from new->rsp
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbp
+    pop  rbx
 
     // ── restore incoming SSE/FPU state ───────────────────────────────────────
-    ldmxcsr 264(%rsi)
-    movdqu  8(%rsi),   %xmm0
-    movdqu  24(%rsi),  %xmm1
-    movdqu  40(%rsi),  %xmm2
-    movdqu  56(%rsi),  %xmm3
-    movdqu  72(%rsi),  %xmm4
-    movdqu  88(%rsi),  %xmm5
-    movdqu  104(%rsi), %xmm6
-    movdqu  120(%rsi), %xmm7
-    movdqu  136(%rsi), %xmm8
-    movdqu  152(%rsi), %xmm9
-    movdqu  168(%rsi), %xmm10
-    movdqu  184(%rsi), %xmm11
-    movdqu  200(%rsi), %xmm12
-    movdqu  216(%rsi), %xmm13
-    movdqu  232(%rsi), %xmm14
-    movdqu  248(%rsi), %xmm15
+    ldmxcsr [rsi + 264]
+    movdqu xmm0,  [rsi + 8]
+    movdqu xmm1,  [rsi + 24]
+    movdqu xmm2,  [rsi + 40]
+    movdqu xmm3,  [rsi + 56]
+    movdqu xmm4,  [rsi + 72]
+    movdqu xmm5,  [rsi + 88]
+    movdqu xmm6,  [rsi + 104]
+    movdqu xmm7,  [rsi + 120]
+    movdqu xmm8,  [rsi + 136]
+    movdqu xmm9,  [rsi + 152]
+    movdqu xmm10, [rsi + 168]
+    movdqu xmm11, [rsi + 184]
+    movdqu xmm12, [rsi + 200]
+    movdqu xmm13, [rsi + 216]
+    movdqu xmm14, [rsi + 232]
+    movdqu xmm15, [rsi + 248]
 
     // ── restore FS.base (TLS pointer) via WRMSR on MSR_FS_BASE ──────────────
     // WRMSR: ecx=MSR, edx:eax=value.  Load from offset 272.
-    movq  272(%rsi), %rax
-    movq  %rax, %rdx
-    shrq  $32, %rdx
-    movl  $0xC0000100, %ecx
+    mov  rax, [rsi + 272]
+    mov  rdx, rax
+    shr  rdx, 32
+    mov  ecx, 0xC0000100
     wrmsr
 
-    retq                    // jump to return address / entry point
+    ret                     // jump to return address / entry point
 
 // ── iret_to_user — first entry into a user-space task (x86-64) ───────────────
 //
@@ -563,6 +563,6 @@ cpu_switch_to:
 .global iret_to_user
 .type   iret_to_user, @function
 iret_to_user:
-    iretq
+    iret
 "#);
 
