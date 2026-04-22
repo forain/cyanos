@@ -48,4 +48,7 @@ rustflags = [
     "-C", "linker=rust-lld",
     "-C", "relocation-model=static",
     "-C", "code-model=kernel",
+    "-C", "llvm-args=--x86-asm-syntax=att",
+    "-C", "link-arg=-s",
+    "-C", "strip=symbols",
 ]
