@@ -23,22 +23,22 @@ _start:
     cli
 
     // ── 64-bit stack ──────────────────────────────────────────────────────────
-    leaq    __stack_top(%rip), %rsp
+    lea     rsp, [rip + __stack_top]
 
     // ── Zero BSS ──────────────────────────────────────────────────────────────
-    leaq    __bss_start(%rip), %rdi
-    leaq    __bss_end(%rip),   %rcx
-    subq    %rdi, %rcx
-    shrq    $3,   %rcx          // byte count → u64 count
-    xorq    %rax, %rax
-    rep stosq
+    lea     rdi, [rip + __bss_start]
+    lea     rcx, [rip + __bss_end]
+    sub     rcx, rdi
+    shr     rcx, 3              // byte count → u64 count
+    xor     rax, rax
+    rep     stosq
 
     // ── Call kernel_main(boot_info_addr = 0) ──────────────────────────────────
     // Limine boot info is obtained from static request/response structs
     // (boot::limine), not from a pointer argument.  Pass 0 to distinguish
     // from a multiboot2 address.
-    xorl    %edi, %edi
-    callq   kernel_main
+    xor     edi, edi
+    call    kernel_main
 
 .Lhalt:
     hlt

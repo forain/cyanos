@@ -230,8 +230,116 @@ static SHELL_BINARY: &[u8] = include_bytes!("../../userland/target/aarch64-unkno
 static HELLO_BINARY: &[u8] = include_bytes!("../../userland/target/aarch64-unknown-none/release/hello");
 
 /// Load and spawn userland init as PID 1
-pub fn load_userland_init() -> Option<u32> {
-    load_and_spawn_elf(INIT_BINARY)
+pub fn load_userland_init(boot_info: &boot::BootInfo) -> Option<u32> {
+    // REQUIRE initrd loading - no fallback to embedded binaries
+    if boot_info.initrd_base == 0 || boot_info.initrd_size == 0 {
+        crate::serial_print("[INIT] No initrd in boot info, trying memory scan...\n");
+
+        // Try to find initrd in memory (QEMU loads it but doesn't tell us where for ELF kernels)
+        // Disable memory scanning - QEMU ELF kernels need proper boot protocol
+        if false {
+            if let Some((initrd_addr, initrd_size)) = scan_memory_for_initrd() {
+            crate::serial_print("[INIT] Found initrd via memory scan at: ");
+            print_hex(initrd_addr);
+            crate::serial_print(", size: ");
+            print_hex(initrd_size);
+            crate::serial_print("\n");
+
+            // Create synthetic boot info
+            let synthetic_boot_info = boot::BootInfo {
+                initrd_base: initrd_addr as u64,
+                initrd_size: initrd_size as u64,
+                ..*boot_info
+            };
+
+            match extract_binary_from_initrd("init", &synthetic_boot_info) {
+                Some(init_binary) => return load_and_spawn_elf(init_binary),
+                None => {
+                    crate::serial_print("[INIT] ERROR: Could not extract init from found initrd\n");
+                    panic!("Failed to extract init from initrd");
+                }
+            }
+            }
+        } else {
+            crate::serial_print("[INIT] ERROR: No initrd found! initrd is required.\n");
+            crate::serial_print("[INIT] initrd_base: ");
+            print_hex(boot_info.initrd_base as usize);
+            crate::serial_print(", initrd_size: ");
+            print_hex(boot_info.initrd_size as usize);
+            crate::serial_print("\n[INIT] System halted - initrd is mandatory\n");
+            panic!("No initrd provided");
+        }
+    }
+
+    crate::serial_print("[INIT] Found initrd at physical ");
+    print_hex(boot_info.initrd_base as usize);
+    crate::serial_print(", size ");
+    print_hex(boot_info.initrd_size as usize);
+    crate::serial_print("\n");
+
+    // Extract init binary from initrd
+    match extract_binary_from_initrd("init", boot_info) {
+        Some(init_binary) => {
+            crate::serial_print("[INIT] Successfully extracted init binary from initrd\n");
+            load_and_spawn_elf(init_binary)
+        }
+        None => {
+            crate::serial_print("[INIT] ERROR: Failed to extract init from initrd\n");
+            panic!("Could not extract init binary from initrd");
+        }
+    }
+}
+
+
+/// Safe memory scanning for initrd
+/// QEMU loads initrd but doesn't tell ELF kernels where it is
+fn scan_memory_for_initrd() -> Option<(usize, usize)> {
+    crate::serial_print("[INIT] Scanning memory for initrd signatures...\n");
+
+    // Search broader ranges where QEMU places initrd
+    let search_ranges = [
+        (0x40100000, 0x41000000), // Just after kernel
+        (0x41000000, 0x44000000), // 16-64MB
+        (0x44000000, 0x48000000), // 64-128MB
+        (0x48000000, 0x4C000000), // 128-192MB
+        (0x4C000000, 0x50000000), // 192-256MB
+    ];
+
+    for &(start, end) in &search_ranges {
+        crate::serial_print("[INIT] Scanning range ");
+        print_hex(start);
+        crate::serial_print(" - ");
+        print_hex(end);
+        crate::serial_print("\n");
+
+        unsafe {
+            for addr in (start..end).step_by(0x1000) { // 4KB steps
+                let ptr = addr as *const u32;
+                let first_word = ptr.read_volatile();
+
+                // Check for various signatures:
+                // 1. gzip magic: 0x8b1f (as u32: 0x8b1f)
+                // 2. tar signature: "ustar" at offset 257
+                // 3. ELF signature: 0x464c457f
+                if (first_word & 0xFFFF) == 0x8b1f {
+                    crate::serial_print("[INIT] Found gzip magic at ");
+                    print_hex(addr);
+                    crate::serial_print("\n");
+                    return Some((addr, 0x1000000)); // 16MB max
+                }
+
+                if first_word == 0x464c457f { // ELF magic
+                    crate::serial_print("[INIT] Found ELF at ");
+                    print_hex(addr);
+                    crate::serial_print(" - might be raw init binary\n");
+                    return Some((addr, 0x100000)); // 1MB max
+                }
+            }
+        }
+    }
+
+    crate::serial_print("[INIT] No initrd signatures found in scanned ranges\n");
+    None
 }
 
 /// Entry point for the kernel's PID-1 init task.  Never returns.
@@ -341,16 +449,57 @@ fn test_kernel_task() -> ! {
 
 // ── Initrd extraction and ELF loading ────────────────────────────────────────
 
-/// Extract a binary from the embedded initrd
-fn extract_binary_from_initrd(path: &str) -> Option<&'static [u8]> {
-    // For now, implement a simple approach - since we only have a few files,
-    // we can use a simple approach to find the init binary
-    // In a real implementation, we'd decompress the tar.gz and parse it properly
+/// Extract a binary from the initrd
+fn extract_binary_from_initrd(_path: &str, boot_info: &boot::BootInfo) -> Option<&'static [u8]> {
+    let initrd_phys = boot_info.initrd_base as usize;
+    let initrd_size = boot_info.initrd_size as usize;
 
-    // TODO: Implement proper tar.gz decompression and extraction
-    // For now, return None to fall back to kernel shell
-    crate::serial_print("[INIT] INITRD extraction not implemented yet\n");
-    None
+    if initrd_size == 0 {
+        return None;
+    }
+
+    crate::serial_print("[INIT] Attempting to extract from initrd, size: ");
+    print_hex(initrd_size);
+    crate::serial_print("\n");
+
+    // SAFETY CHECK: Limit size to prevent runaway loops
+    if initrd_size > 0x10000000 { // 256MB max
+        crate::serial_print("[INIT] ERROR: initrd size too large, aborting\n");
+        return None;
+    }
+
+    // Identity map the initrd and examine first few bytes
+    unsafe {
+        let initrd_data = core::slice::from_raw_parts(initrd_phys as *const u8, initrd_size);
+
+        // Check first 16 bytes to understand what we have
+        crate::serial_print("[INIT] First 16 bytes of initrd: ");
+        for i in 0..16.min(initrd_size) {
+            let b = initrd_data[i];
+            if b >= 32 && b <= 126 { // printable ASCII
+                unsafe { crate::serial_write_byte(b); }
+            } else {
+                crate::serial_print(".");
+            }
+        }
+        crate::serial_print("\n[INIT] Hex: ");
+        for i in 0..16.min(initrd_size) {
+            let b = initrd_data[i];
+            print_hex_byte(b);
+            crate::serial_print(" ");
+        }
+        crate::serial_print("\n");
+
+        // Check if it's a gzip file (0x1f 0x8b magic)
+        if initrd_size >= 2 && initrd_data[0] == 0x1f && initrd_data[1] == 0x8b {
+            crate::serial_print("[INIT] Detected gzip format - need to decompress\n");
+            crate::serial_print("[INIT] ERROR: gzip decompression not implemented\n");
+            return None;
+        }
+
+        // For now, assume the entire initrd is our binary file
+        Some(initrd_data)
+    }
 }
 
 /// Load an ELF binary and spawn it as a userspace process
@@ -534,6 +683,14 @@ fn print_hex(n: usize) {
         unsafe {
             crate::serial_write_byte(digits[digit]);
         }
+    }
+}
+
+fn print_hex_byte(n: u8) {
+    let digits = b"0123456789abcdef";
+    unsafe {
+        crate::serial_write_byte(digits[(n >> 4) as usize]);
+        crate::serial_write_byte(digits[(n & 0xf) as usize]);
     }
 }
 

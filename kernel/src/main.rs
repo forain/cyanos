@@ -14,6 +14,7 @@ use core::alloc::{GlobalAlloc, Layout};
 
 mod init;
 mod syscall;
+mod mem;
 
 // ── Global Allocator ─────────────────────────────────────────────────────────
 
