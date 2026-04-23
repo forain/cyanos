@@ -1,3 +1,7 @@
 target/
 **/*.swp
 .DS_Store
+*.img
+*.vdi
+*.cpio.gz
+temp_fat_*.img

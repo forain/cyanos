@@ -80,6 +80,7 @@ pub unsafe fn parse(mbi_phys: usize) -> BootInfo {
         uart_base:           0,
         initrd_base:         0,
         initrd_size:         0,
+        hhdm_offset:         0,
     };
 
     // MBI starts with total_size (u32) + reserved (u32), then tags.

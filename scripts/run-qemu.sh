@@ -82,13 +82,13 @@ if [ "$ARCH" = "aarch64" ]; then
     QEMU_SYSTEM="qemu-system-aarch64"
     MACHINE_ARGS="-machine virt -cpu cortex-a57"
     DISK_IMAGE="cyanos-limine-aarch64.img"
-    KERNEL_DIRECT="target/aarch64-unknown-kernel/release/kernel-direct"
+    KERNEL_DIRECT="target/final-aarch64/kernel-direct"
     FW_PATHS=("${AARCH64_FW_PATHS[@]}")
 else
     QEMU_SYSTEM="qemu-system-x86_64"
     MACHINE_ARGS="-machine q35"
     DISK_IMAGE="cyanos-limine-x86_64.img"
-    KERNEL_DIRECT="target/x86_64-unknown-kernel/release/kernel-direct"
+    KERNEL_DIRECT="target/final-x86_64/kernel-direct"
     FW_PATHS=("${X86_64_FW_PATHS[@]}")
 fi
 

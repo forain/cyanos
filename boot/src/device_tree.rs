@@ -72,6 +72,7 @@ pub unsafe fn parse(dtb_phys: usize) -> BootInfo {
         uart_base:           0,
         initrd_base:         0,
         initrd_size:         0,
+        hhdm_offset:         0,
     };
 
     // 64 slots: enough for all available regions + firmware memreserve entries.
@@ -387,5 +388,6 @@ pub fn create_qemu_virt_default() -> BootInfo {
         uart_base: 0x09000000, // QEMU virt PL011 UART
         initrd_base: 0,
         initrd_size: 0,
+        hhdm_offset: 0,
     }
 }

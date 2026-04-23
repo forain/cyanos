@@ -52,6 +52,8 @@ pub struct BootInfo {
     /// Initrd/ramdisk physical address and size (0 if not present).
     pub initrd_base:         u64,
     pub initrd_size:         u64,
+    /// Higher-Half Direct Map virtual offset (0 if not present).
+    pub hhdm_offset:         u64,
 }
 
 // SAFETY: the BootInfo struct is set up once by the entry stub before any

@@ -79,9 +79,11 @@ _start:
     str     w21, [x20]
 
     // ── Set up initial stack (SP_EL1) ─────────────────────────────────────────
-    // Set up a temporary fixed stack since BSS symbols may not be available
-    mov     x1, 0x7c00000           // Use a high memory address as stack
-    and     x1, x1, #-16           // Align to 16 bytes
+    // Use the stack defined in Rust
+    adrp    x1, EARLY_STACK
+    add     x1, x1, :lo12:EARLY_STACK
+    mov     x2, #0x10000            // 64 KiB
+    add     x1, x1, x2
     mov     sp, x1
 
     // Debug: Stack set up - write 'E'
@@ -98,8 +100,17 @@ _start:
     str     w21, [x20]
 
     // ── Zero the BSS section ──────────────────────────────────────────────────
-    // BSS clearing temporarily disabled since linker script symbols may not be available
-    // This is acceptable for initial testing
+    adrp    x0, __bss_start
+    add     x0, x0, :lo12:__bss_start
+    adrp    x1, __bss_end
+    add     x1, x1, :lo12:__bss_end
+    sub     x1, x1, x0
+    cbz     x1, .Lbss_done
+.Lbss_loop:
+    str     xzr, [x0], #8
+    subs    x1, x1, #8
+    bgt     .Lbss_loop
+.Lbss_done:
 
     // Debug: BSS cleared - write 'G'
     mov     x20, 0x09000000

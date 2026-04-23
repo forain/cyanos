@@ -1,55 +1,63 @@
 ENTRY(_start)
 OUTPUT_FORMAT(elf64-x86-64)
 
-SECTIONS {
-    . = 0xffffffff80200000;
+PHDRS
+{
+    limine_requests PT_LOAD;
+    text PT_LOAD;
+    rodata PT_LOAD;
+    data PT_LOAD;
+}
 
-    .multiboot2_header ALIGN(8) : AT(ADDR(.multiboot2_header) - 0xffffffff80000000) {
-        *(.multiboot2_header*)
-    }
+SECTIONS
+{
+    . = 0xffffffff80000000;
 
-    /* .note.Xen section removed due to linker issues */
+    .limine_requests : {
+        KEEP(*(.limine_reqs))
+    } :limine_requests
 
-    .text ALIGN(4K) : AT(ADDR(.text) - 0xffffffff80000000) {
+    . = ALIGN(4K);
+
+    .text : {
         __text_start = .;
-        *(.text*)
-    }
-
-    .rodata ALIGN(4K) : AT(ADDR(.rodata) - 0xffffffff80000000) {
+        *(.text .text.*)
         __text_end = .;
+    } :text
+
+    . = ALIGN(4K);
+
+    .rodata : {
         __rodata_start = .;
-        *(.rodata*)
-        __altcode_start = .;
-        KEEP(*(.altcode*))
-        __altcode_end = .;
-        . = ALIGN(8);
-        __altrelocs_start = .;
-        KEEP(*(.altrelocs*))
-        __altrelocs_end = .;
-        __altfeatures_start = .;
-        KEEP(*(.altfeatures*))
-        __altfeatures_end = .;
-    }
-
-    .data ALIGN(4K) : AT(ADDR(.data) - 0xffffffff80000000) {
+        *(.rodata .rodata.*)
+        *(.gcc_except_table*)
         __rodata_end = .;
-        *(.data*)
-        *(.limine_requests*)
-        . = ALIGN(4K);
-        __bss_start = .;
-        *(.bss*)
-        . = ALIGN(8);
-        __bss_end = .;
-    }
+    } :rodata
 
-    __end = .;
-    __kernel_end = .;
+    . = ALIGN(4K);
+
+    .data : {
+        __data_start = .;
+        *(.data .data.*)
+        *(.got .got.*)
+        *(.data.rel.ro .data.rel.ro.*)
+        *(.tdata .tdata.*)
+        __data_end = .;
+    } :data
+
+    .bss : {
+        . = ALIGN(8);
+        PROVIDE(__bss_start = .);
+        *(.bss .bss.*)
+        *(.tbss .tbss.*)
+        *(COMMON)
+        PROVIDE(__bss_end = .);
+    } :data
 
     /DISCARD/ : {
         *(.comment*)
         *(.eh_frame*)
-        *(.gcc_except_table*)
         *(.note*)
-        *(.rel.eh_frame*)
+        *(.multiboot2_header*)
     }
 }

@@ -34,6 +34,7 @@ const SPURIOUS_VEC: u32 = 0xFF;
 
 // ── Cached LAPIC MMIO base (default 0xFEE0_0000) ─────────────────────────────
 static mut LAPIC_BASE: usize = 0xFEE0_0000;
+static mut HHDM_OFFSET: u64 = 0;
 
 // ── Low-level helpers ─────────────────────────────────────────────────────────
 
@@ -99,10 +100,28 @@ unsafe fn mask_pic() {
 ///
 /// Must be called after the IDT is loaded (so LAPIC interrupts have handlers)
 /// but before `timer::init()` programs the APIC timer.
+pub unsafe fn set_hhdm_offset(offset: u64) {
+    HHDM_OFFSET = offset;
+}
+
+/// Initialise the Local APIC.
+///
+/// • Reads the APIC base address from IA32_APIC_BASE MSR.
+/// • Ensures the global APIC enable bit is set.
+/// • Masks the legacy 8259 PIC.
+/// • Enables the LAPIC via the Spurious Vector Register.
+/// • Sets Task Priority Register to 0 (accept all priorities).
+///
+/// Must be called after the IDT is loaded (so LAPIC interrupts have handlers)
+/// but before `timer::init()` programs the APIC timer.
 pub unsafe fn init() {
     // Read current APIC base; extract MMIO address and re-enable if needed.
     let apic_msr = rdmsr(IA32_APIC_BASE_MSR);
-    LAPIC_BASE   = (apic_msr & APIC_BASE_MASK) as usize;
+    // Use HHDM offset if provided, otherwise fallback to the standard high-half mapping
+    // for Limine/UEFI kernels linked at -2GB.
+    let phys_base = apic_msr & APIC_BASE_MASK;
+    let offset = if HHDM_OFFSET != 0 { HHDM_OFFSET } else { 0xffff800000000000 };
+    LAPIC_BASE   = (phys_base + offset) as usize;
     wrmsr(IA32_APIC_BASE_MSR, apic_msr | APIC_GLOBAL_ENABLE);
 
     // Mask 8259 before unmasking LAPIC to prevent spurious legacy IRQs.

@@ -78,8 +78,8 @@ _start:
 
 .Lcommon_setup:
     // ── 64-bit stack ──────────────────────────────────────────────────────────
-    // Use the stack defined in the BSS section
-    lea     rsp, [rip + stack_top]
+    // Use the stack defined in Rust
+    lea     rsp, [rip + EARLY_STACK + 0x10000]
 
     // Debug: Write 'X' to COM1 to show we reached assembly entry
     mov     al, 'X'
@@ -105,10 +105,3 @@ _start:
 .Lhalt:
     hlt
     jmp     .Lhalt
-
-// ── Early Stack ──────────────────────────────────────────────────────────────
-    .section .bss
-    .align 16
-stack_bottom:
-    .skip 0x10000 // 64 KiB
-stack_top:
